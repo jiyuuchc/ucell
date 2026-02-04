@@ -1,0 +1,131 @@
+import random
+import datasets
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from torchvision.transforms import v2
+
+# task_names = [
+#     'livecell_shsy5y', 'livecell_bv2', 'livecell_mcf7', 'livecell_huh7', 'livecell_skov3', 'livecell_a172', 
+#     'livecell_skbr3', 'livecell_bt474', 'nips_0', 'nips_1', 'nips_2', 'nips_3', 'nips_4', 'nips_5', 'nips_6', 
+#     'nips_7', 'ov', 'yeaz_bf', 'yeaz_ph', 'omni_fl', 'omni_ph', 'monusac', 'tissuenet_f', 'cellpose', 'ctc', 
+#     'tissuenet_n']
+
+# task_id_map = dict(zip(task_names, range(len(task_names))))
+
+def pad_channel(image):
+    if image.ndim == 2:
+        image = image[...,None]
+    if image.shape[-1] == 1:
+        image = np.tile(image, (1, 1, 3))
+    elif image.shape[-1] == 2:
+        image = np.pad(image, [[0, 0], [0, 0], [0, 1]])
+    return image
+
+
+def random_flip(image, label):
+    if random.random() >= .5:
+        image = image[::-1]
+        label = label[::-1] * (-1, 1)
+    if random.random() >= .5:
+        image = image[:, ::-1]
+        label = label[:, ::-1] * (1, -1)
+    if random.random() >= .5:
+        image = image.transpose(1, 0, 2)
+        label = label[..., (1,0)].transpose(1, 0, 2)
+
+    return image, label
+    
+
+def format_and_augment(example, *, imagesize = 256, augment=True):
+    image, label, sz = example['image'], example['flow'], example['sz']
+    if example['src'].startswith("omni"):
+        sz /= 1.6
+
+    # preprocess
+    image = pad_channel(image)
+    label = np.moveaxis(label, 0, -1)
+
+    if augment:
+        image, label = random_flip(image, label)
+
+    # combine
+    label_mask = (label != 0).any(axis=-1, keepdims=True).astype(image.dtype)
+    combined = np.c_[image, label, label_mask]
+
+    if not augment:
+        T = v2.Compose([
+            v2.ToImage(),
+            v2.CenterCrop(imagesize),
+        ])
+        combined = T(combined)
+
+    else:
+        scaling = 2 ** (0.6 * random.normalvariate(0, 1)) * (sz / 35)
+        aniso = 2 ** (0.2 * random.normalvariate(0, 1))
+        scaling = np.clip([scaling * aniso, scaling / aniso], 0.3, 3.3)
+        height, width = (imagesize * scaling).astype(int)
+
+        T = v2.Compose([
+            v2.ToImage(),
+            v2.RandomCrop(size=(height, width), pad_if_needed=True),
+            v2.Resize(size=(imagesize, imagesize), antialias=False),
+        ])
+        combined = T(combined)
+
+    image = combined[:3] / 256
+    label = combined[3:]
+
+    return dict(image=image, label=label, task_id=0)
+
+
+def train_process(examples):
+    # return format_and_augment(examples[0])
+    augmented = []
+    for example in examples:
+        augmented.append(format_and_augment(example))
+    
+    return torch.utils.data.default_collate(augmented)
+
+
+def test_process(examples):
+    processed = []
+    for example in examples:
+        processed.append(format_and_augment(example, augment=False))
+
+    return torch.utils.data.default_collate(processed)
+
+def scs(config, split):
+    ds = (
+        datasets.load_dataset(
+            "jiyuuchc/scs", 
+            split=split,
+            token=config.token if len(config.token) > 0 else None,
+        )
+        .with_format('numpy')
+        .repeat(config.epochs_per_iter if split == 'train' else 1)
+    )
+
+    if split == "train":
+        dataloader = DataLoader(
+            ds, 
+            batch_size=config.batch_size,
+            shuffle=True, 
+            collate_fn=train_process, 
+            num_workers=config.dataloader_workers,
+            prefetch_factor=1,
+            drop_last=True,
+            pin_memory=True,
+        )
+    else:
+        dataloader = DataLoader(
+            ds, 
+            batch_size=config.batch_size,
+            shuffle=False,
+            collate_fn=test_process, 
+            num_workers=4,
+            drop_last=True,
+            pin_memory=True,
+        )
+
+    return dataloader
