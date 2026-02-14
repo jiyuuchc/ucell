@@ -111,11 +111,11 @@ class FRM(nn.Module):
 
         return (z_H, z_L), output
 
-    def predict(self, inputs):
+    def predict(self, inputs, task_id=0):
         B, H, W, C = inputs.shape
         
         image = torch.asarray(inputs, copy=True).to(torch.float32).permute(0, 3, 1, 2)
-        batch = dict(image=image, task_id=torch.zeros([B], dtype=torch.int32))
+        batch = dict(image=image, task_id=torch.ones([B], dtype=torch.int32) * task_id)
 
         with torch.no_grad():
             z = torch.zeros([B, self.config.seq_len + self.config.task_emb_len, self.config.hidden_size])

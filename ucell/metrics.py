@@ -153,7 +153,10 @@ class LabelMetrics:
         else:
             gt_dice = (gt_areas / gt_areas.sum() * gt_scores).sum()
 
-        dice = (pred_dice + gt_dice) / 2
+        if n_preds == 0 and n_gts == 0:
+            dice = np.nan
+        else:
+            dice = (pred_dice + gt_dice) / 2
 
         return dict(
             n_preds = n_preds,
@@ -161,7 +164,7 @@ class LabelMetrics:
             n_tps = n_tps,
             accuracy = n_tps / n_preds if n_preds > 0 else float('nan'),
             recall = n_tps / n_gts if n_gts > 0 else float('nan'),
-            f1 = (2 * n_tps) / (n_preds + n_gts) if n_tps > 0 else 0,
+            f1 = (2 * n_tps) / (n_preds + n_gts) if n_gts + n_preds > 0 else float('nan'),
             instance_dice = dice,
             ap = n_tps /(n_gts + n_preds - n_tps) if n_gts + n_preds > 0 else float('nan'),
         )

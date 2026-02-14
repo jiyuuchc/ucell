@@ -197,3 +197,4 @@ _version.py
 run/
 wandb/
 checkpoints/
+predictions/

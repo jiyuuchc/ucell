@@ -2,10 +2,12 @@ from absl import app, flags
 from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import wandb
-# from adam_atan2 import AdamATan2
+
 from ml_collections import config_flags
 from tqdm import tqdm
 from ucell.frm import FRMWrapper
@@ -16,9 +18,11 @@ from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 flags.DEFINE_string("resume", None, "resume a stopped run")
 flags.DEFINE_string("dir", "checkpoints", "checkpointing location")
 flags.DEFINE_string("init", None, "initalization weights")
+flags.DEFINE_integer("num_nodes", 1, "number of nodes for distributed training")
 
 _CONFIG = config_flags.DEFINE_config_file("config", "config.py")
-fabric = Fabric(precision="bf16-mixed")
+
+fabric = None
 
 @dataclass
 class TrainState:
@@ -69,10 +73,16 @@ def create_dataloader(config, split: str):
 
 
 def cp_dir(logger:WandbLogger):
-    run_name = str(logger.experiment.name)
+    if fabric.is_global_zero:
+        run_name = str(logger.experiment.name)
+    else:
+        run_name = "_"
+
+    run_name = fabric.broadcast(run_name, src=0)
     run_name = run_name.split("-")
 
     return Path(logger.save_dir) / "-".join(run_name[-1:] + run_name[:-1])
+
 
 def save_state(train_state, logger:WandbLogger):
     cp = dict(
@@ -88,11 +98,10 @@ def save_state(train_state, logger:WandbLogger):
 
 
 def resume_state(train_state, logger:WandbLogger):
-    if fabric.is_global_zero:
-        cp_file = sorted(list(cp_dir(logger).glob("*.pt")))[-1]
-    else:
-        cp_file = None
+    cp_file = sorted(list(cp_dir(logger).glob("cp*")))[-1]
     
+    fabric.print(f"Loading checkpoint from {cp_file}")
+ 
     cp = fabric.load(cp_file)
 
     train_state.step = cp['step']
@@ -107,9 +116,11 @@ def setup_logging(config):
     logger = WandbLogger(
         project=config.name, 
         id=flags.FLAGS.resume, 
-        dir=flags.FLAGS.dir,
+        save_dir=flags.FLAGS.dir,
         config=config.to_dict(),
     )
+
+    fabric.print(f"Checkpoints saved in {cp_dir(logger)}")
 
     return logger
 
@@ -205,22 +216,45 @@ def evaluate(model, dataloader):
 
     return metrics
 
+def set_lr(train_state, dataset_size):
+    config = _CONFIG.value
+
+    factor = 1.
+
+    if config.opt.cosine_anealing:
+        total_steps = config.n_iters * dataset_size * fabric.world_size
+        factor = 0.5 * (1 + np.cos(np.pi * train_state.step / total_steps))
+
+    if train_state.step < config.opt.warmup_steps and flags.FLAGS.resume is None:
+        factor *= train_state.step / config.opt.warmup_steps
+
+    for gr in train_state.optimizer.param_groups:
+        gr['lr'] = config.opt.lr * factor
+
 
 def run(_):
+    global fabric
+
     config = _CONFIG.value
+
+    fabric = Fabric(precision="bf16-mixed", num_nodes=flags.FLAGS.num_nodes)
+
+    fabric.launch()
 
     train_state, logger = setup(config)
 
     train_data = create_dataloader(config, 'train')
     test_data = create_dataloader(config, 'test')
 
-    for i in range(config.n_iters):
+    for i in range(config.n_iters):                
         train_state.metrics = AverageMetric()
 
         if fabric.is_global_zero:
             progress_bar = tqdm(total=len(train_data), desc=f"Iteration {i+1}")
 
         for k, batch in enumerate(train_data):
+            set_lr(train_state, len(train_data))
+
             all_halted = False
             while not all_halted:
                 train_state = train_batch(config, train_state, batch)
@@ -250,5 +284,4 @@ def run(_):
         logger.experiment.log_model(artifact, aliases=aliases)
 
 if __name__ == "__main__":
-    fabric.launch()
     app.run(run)

@@ -1,3 +1,4 @@
+from functools import partial
 import random
 import datasets
 import numpy as np
@@ -5,13 +6,12 @@ import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 
-# task_names = [
-#     'livecell_shsy5y', 'livecell_bv2', 'livecell_mcf7', 'livecell_huh7', 'livecell_skov3', 'livecell_a172', 
-#     'livecell_skbr3', 'livecell_bt474', 'nips_0', 'nips_1', 'nips_2', 'nips_3', 'nips_4', 'nips_5', 'nips_6', 
-#     'nips_7', 'ov', 'yeaz_bf', 'yeaz_ph', 'omni_fl', 'omni_ph', 'monusac', 'tissuenet_f', 'cellpose', 'ctc', 
-#     'tissuenet_n']
-
-# task_id_map = dict(zip(task_names, range(len(task_names))))
+task_id_map = {
+    'cellpose': 0,
+    "tissuenet": 1,
+    "livecell": 2,
+    'nips': 3,
+}
 
 def pad_channel(image):
     if image.ndim == 2:
@@ -75,23 +75,23 @@ def format_and_augment(example, *, imagesize = 256, augment=True):
 
     image = combined[:3] / 256
     label = combined[3:]
+    task_id = task_id_map[example['src']]
 
-    return dict(image=image, label=label, task_id=0)
+    return dict(image=image, label=label, task_id=task_id)
 
 
-def train_process(examples):
-    # return format_and_augment(examples[0])
+def train_process(examples, imagesize=256):
     augmented = []
     for example in examples:
-        augmented.append(format_and_augment(example))
+        augmented.append(format_and_augment(example, imagesize=imagesize))
     
     return torch.utils.data.default_collate(augmented)
 
 
-def test_process(examples):
+def test_process(examples, imagesize=256):
     processed = []
     for example in examples:
-        processed.append(format_and_augment(example, augment=False))
+        processed.append(format_and_augment(example, imagesize=imagesize, augment=False))
 
     return torch.utils.data.default_collate(processed)
 
@@ -102,6 +102,7 @@ def scs(config, split):
             split=split,
             token=config.token if len(config.token) > 0 else None,
         )
+        .filter(lambda x: x['src'] != "tissuenet_n")
         .with_format('numpy')
         .repeat(config.epochs_per_iter if split == 'train' else 1)
     )
@@ -111,7 +112,7 @@ def scs(config, split):
             ds, 
             batch_size=config.batch_size,
             shuffle=True, 
-            collate_fn=train_process, 
+            collate_fn=partial(train_process, imagesize=config.image_size),
             num_workers=config.dataloader_workers,
             prefetch_factor=1,
             drop_last=True,
@@ -122,7 +123,7 @@ def scs(config, split):
             ds, 
             batch_size=config.batch_size,
             shuffle=False,
-            collate_fn=test_process, 
+            collate_fn=partial(test_process, imagesize=config.image_size),
             num_workers=4,
             drop_last=True,
             pin_memory=True,
