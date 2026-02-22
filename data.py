@@ -16,6 +16,12 @@ task_id_map = {
 def pad_channel(image):
     if image.ndim == 2:
         image = image[...,None]
+
+    if image.shape[0] <= 3:
+        image = np.moveaxis(image, 0, -1)
+
+    image = np.stack([c for c in np.moveaxis(image, -1, 0) if c.any()], axis=-1)
+
     if image.shape[-1] == 1:
         image = np.tile(image, (1, 1, 3))
     elif image.shape[-1] == 2:

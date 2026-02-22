@@ -18,11 +18,18 @@ from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 flags.DEFINE_string("resume", None, "resume a stopped run")
 flags.DEFINE_string("dir", "checkpoints", "checkpointing location")
 flags.DEFINE_string("init", None, "initalization weights")
-flags.DEFINE_integer("num_nodes", 1, "number of nodes for distributed training")
 
 _CONFIG = config_flags.DEFINE_config_file("config", "config.py")
 
-fabric = None
+import os
+try:
+    num_nodes = int(os.environ['SLURM_NNODES'])
+except KeyError:
+    import warnings
+    warnings.warn("Not running within a Slurm job. Assuming one node")
+    num_nodes = 1
+
+fabric = Fabric(precision="bf16-mixed", num_nodes=num_nodes)
 
 @dataclass
 class TrainState:
@@ -129,15 +136,18 @@ def setup(config):
     logger = setup_logging(config)
 
     model = FRMWrapper(config)
+
     if flags.FLAGS.init is not None:
-        cp = torch.load(flags.FLAGS.init, weights_only=True)
-        if 'model' in cp:
-            cp = cp['model']
-        model.load_state_dict(cp, strict=False)
+        model.load_checkpoint(flags.FLAGS.init)
+
+    if config.train_emb_only:
+        for name, p in model.named_parameters():
+            if not "task_emb" in name:
+                p.requires_grad = False
 
     ema_model = AveragedModel(model, avg_fn=get_ema_avg_fn(config.ema_decay))
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=config.opt.lr,
         weight_decay=config.opt.weight_decay,
         betas=(config.opt.beta1, config.opt.beta2)    
@@ -221,8 +231,8 @@ def set_lr(train_state, dataset_size):
 
     factor = 1.
 
-    if config.opt.cosine_anealing:
-        total_steps = config.n_iters * dataset_size * fabric.world_size
+    if config.opt.cosine_annealing:
+        total_steps = config.n_iters * dataset_size * config.halt_max_steps * fabric.world_size
         factor = 0.5 * (1 + np.cos(np.pi * train_state.step / total_steps))
 
     if train_state.step < config.opt.warmup_steps and flags.FLAGS.resume is None:
@@ -231,16 +241,13 @@ def set_lr(train_state, dataset_size):
     for gr in train_state.optimizer.param_groups:
         gr['lr'] = config.opt.lr * factor
 
+    return config.opt.lr * factor
+
 
 def run(_):
-    global fabric
-
-    config = _CONFIG.value
-
-    fabric = Fabric(precision="bf16-mixed", num_nodes=flags.FLAGS.num_nodes)
-
     fabric.launch()
 
+    config = _CONFIG.value
     train_state, logger = setup(config)
 
     train_data = create_dataloader(config, 'train')
@@ -253,7 +260,7 @@ def run(_):
             progress_bar = tqdm(total=len(train_data), desc=f"Iteration {i+1}")
 
         for k, batch in enumerate(train_data):
-            set_lr(train_state, len(train_data))
+            cur_lr = set_lr(train_state, len(train_data))
 
             all_halted = False
             while not all_halted:
@@ -265,11 +272,12 @@ def run(_):
 
             if k % 10 == 0:
                 metrics = {k: fabric.all_reduce(v) for k, v in train_state.metrics.compute().items()}
-                logger.log_metrics(dict(train=metrics), step=train_state.step)
+                logger.log_metrics(dict(train=metrics, lr=cur_lr), step=train_state.step)
 
         save_state(train_state, logger)
 
         eval_metrics = evaluate(train_state.model, test_data)
+        fabric.print(f"Eval metrics: {eval_metrics}")
 
         logger.log_metrics(dict(eval=eval_metrics), step=train_state.step)
         logger.save()

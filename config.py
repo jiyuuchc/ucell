@@ -1,14 +1,15 @@
-from logging import config
-
+import random
 from ml_collections import ConfigDict
 
 def base():
     config = ConfigDict()
     config.name = "ucell"
-    config.seed = 42
     config.token = ""
     config.ema_decay = 0.999
     config.image_size = 256
+    config.train_emb_only = False
+
+    config.seed = random.randint(0, 1000000)
 
     config.dataset = "scs"
     config.batch_size = 48
@@ -27,17 +28,18 @@ def base():
     config.model.forward_dtype="bfloat16"
     config.model.pos_emb="rope"
     config.model.hidden_size = 1024
-    config.model.task_emb_len = 64
+    config.model.num_z_tokens = 64
+    config.model.num_task_emb_tokens = 64
     config.model.depth = 2
     config.model.num_heads = config.model.get_ref('hidden_size')//64
     config.model.num_tasks = 26
-    config.model.seq_len = 1024 * 64 // (config.model.get_ref('patch_size') ** 2)
+    config.model.seq_len = (config.get_ref("image_size") // config.model.get_ref('patch_size')) ** 2
     config.model.H_cycles = 1
     config.model.L_cycles = 20
 
     config.opt = ConfigDict()
     config.opt.lr = 1e-4
-    config.opt.cosine_anealing = False
+    config.opt.cosine_annealing = False
     config.opt.weight_decay = 1.0
     config.opt.beta1 = 0.9
     config.opt.beta2 = 0.95
@@ -57,6 +59,14 @@ def get_config(cfg="default"):
         config.halt_max_steps=7
         config.model.H_cycles=1
         config.model.L_cycles=2
+    elif cfg == "train_emb":
+        config.halt_max_steps=3
+        config.model.H_cycles=1
+        config.model.L_cycles=6
+        config.train_emb_only = True
+        config.opt.lr = 1e-3
+        config.opt.cosine_annealing = True
+        config.n_iters = 1
     else:
         assert cfg == 'default'
 

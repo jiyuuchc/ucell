@@ -1,3 +1,4 @@
+import warnings
 from dataclasses import dataclass
 import math
 import torch
@@ -55,8 +56,8 @@ class FRM(nn.Module):
 
         self.patch_emb = nn.Conv2d(3, config.hidden_size, kernel_size=ps, stride=ps, padding=0)
 
-        self.task_emb = CastedEmbedding(config.num_tasks, config.task_emb_len * config.hidden_size,
-                                init_std=0, cast_to=dtype)        
+        self.task_emb = CastedEmbedding(config.num_tasks, config.num_task_emb_tokens * config.hidden_size,
+                                init_std=0, cast_to=dtype)
     
         if config.pos_emb == 'learned':
             self.pos_emb = CastedEmbedding(config.seq_len, config.hidden_size, init_std=embed_init_std, cast_to=dtype)
@@ -81,6 +82,8 @@ class FRM(nn.Module):
         # task embeddings
         task_embedding = self.task_emb(task_id)
         task_embedding = rearrange(task_embedding, "b (l d) -> b l d", d=self.config.hidden_size)
+        num_addition_tokens = self.config.num_z_tokens - task_embedding.shape[1]
+        task_embedding = F.pad(task_embedding, (0, 0, 0, num_addition_tokens), value=0)
 
         embedding = torch.cat((task_embedding, embedding), dim=1)
 
@@ -91,7 +94,7 @@ class FRM(nn.Module):
         # Input encoding
         input_embeddings, (h, w) = self._input_embeddings(batch["image"], batch["task_id"])
 
-        D = self.config.task_emb_len
+        D = self.config.num_z_tokens
 
         def L_level(z_H, z_L):
             z = torch.concat([z_L, z_H], dim=1)
@@ -125,6 +128,46 @@ class FRM(nn.Module):
 
         return out.detach().cpu().numpy()
 
+    
+    def load_state_dict(self, state_dict, strict=True):
+        # remove unnecessary key prefixes (e.g., "module.") added by FrmWrapper, EMA or fabric
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("module."):
+                k = k[len("module."):]
+            if k.startswith("inner."):
+                k = k[len("inner."):]
+            new_state_dict[k] = v
+        
+        # if embedding dim mismatch, give a warning and load only the rest of the state
+        model_state_dict = self.state_dict()
+        for k in model_state_dict.keys():
+            if 'task_emb' in k and k in new_state_dict and new_state_dict[k].shape != model_state_dict[k].shape:
+                warnings.warn(f"Shape mismatch for key {k}, model shape {model_state_dict[k].shape}, checkpoint shape {new_state_dict[k].shape}. Skipping this key.")
+                new_state_dict[k] = model_state_dict[k]
+
+        super().load_state_dict(new_state_dict, strict=strict)
+
+
+    def load_checkpoint(self, checkpoint, strict=True):
+        # checkpoint can be a path or a path:key where key specifies which part of the checkpoint to load as model state dict
+        if ":" in str(checkpoint):
+            cp_path, key = str(checkpoint).split(":")
+        else:
+            cp_path, key = str(checkpoint), 'model'
+
+        cp = torch.load(cp_path, weights_only=False)
+
+        if isinstance(cp, torch.nn.Module):
+            cp = cp.state_dict()
+        
+        if key in cp:
+            cp = cp[key]
+        else:
+            warnings.warn(f"Key '{key}' not found in checkpoint {cp_path}. Attempting to load entire checkpoint as model state dict.")
+
+        self.load_state_dict(cp, strict=strict)
+
 
 class FRMWrapper(nn.Module):
     def __init__(self, config):
@@ -141,7 +184,7 @@ class FRMWrapper(nn.Module):
         )
         z_L = torch.tile(
             torch.zeros_like(t_[:, None, None], dtype=self.inner.dtype),
-            (1, model_cfg.task_emb_len, model_cfg.hidden_size)
+            (1, model_cfg.num_z_tokens, model_cfg.hidden_size)
         )
 
         return FrmCarry(
@@ -217,3 +260,6 @@ class FRMWrapper(nn.Module):
             )
         
         return output
+
+    def load_checkpoint(self, checkpoint, strict=True):
+        self.inner.load_checkpoint(checkpoint, strict=strict)

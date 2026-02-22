@@ -34,20 +34,12 @@ def load_model():
     config.model.forward_dtype = "float32"
     model = FRMWrapper(config).eval()
 
-    cp_path = flags.FLAGS.model
-    cp = torch.load(cp_path, weights_only=True)
-    if "ema_model" in cp:
-        model_ = nn.Module()
-        model_.module = model
-        model_.load_state_dict(cp['ema_model'], strict=False)
-    elif "model" in cp:
-        model.load_state_dict(cp['model'])
-    else:
-        model.load_state_dict(cp)
+    model.load_checkpoint(flags.FLAGS.model)
 
     model = model.to('cuda')
     
     return torch.compile(model.inner)
+
 
 def format_image(img):
     img = img - img.min()
@@ -55,6 +47,10 @@ def format_image(img):
     if img.ndim == 2:
         img = img[..., None]
     assert img.ndim == 3
+
+    if img.shape[0] <= 3:
+        img = np.moveaxis(img, 0, -1)
+ 
     if img.shape[-1] == 1:
         img = np.repeat(img, 3, axis=-1)
     elif img.shape[-1] == 2:
