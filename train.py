@@ -1,4 +1,6 @@
-from absl import app, flags
+import os
+import warnings
+
 from typing import Any
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,12 +10,14 @@ import torch
 import torch.nn as nn
 import wandb
 
+from absl import app, flags
 from ml_collections import config_flags
 from tqdm import tqdm
-from ucell.frm import FRMWrapper
 from lightning.fabric import Fabric
 from wandb.integration.lightning.fabric import WandbLogger
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
+
+from ucell.frm import FRMWrapper
 
 flags.DEFINE_string("resume", None, "resume a stopped run")
 flags.DEFINE_string("dir", "checkpoints", "checkpointing location")
@@ -21,11 +25,9 @@ flags.DEFINE_string("init", None, "initalization weights")
 
 _CONFIG = config_flags.DEFINE_config_file("config", "config.py")
 
-import os
 try:
     num_nodes = int(os.environ['SLURM_NNODES'])
 except KeyError:
-    import warnings
     warnings.warn("Not running within a Slurm job. Assuming one node")
     num_nodes = 1
 
@@ -135,7 +137,8 @@ def setup_logging(config):
 def setup(config):
     logger = setup_logging(config)
 
-    model = FRMWrapper(config)
+    with fabric.init_module():
+        model = FRMWrapper(config)
 
     if flags.FLAGS.init is not None:
         model.load_checkpoint(flags.FLAGS.init)
@@ -171,7 +174,7 @@ def setup(config):
 
 
 def train_batch(config, train_state, batch)->TrainState:
-    train_state.step += fabric.world_size
+    train_state.step += 1
 
     # Init carry if it is None
     if train_state.carry is None:
@@ -245,9 +248,13 @@ def set_lr(train_state, dataset_size):
 
 
 def run(_):
+    config = _CONFIG.value
+    print(config)
+
+    fabric.seed_everything(config.seed)
+
     fabric.launch()
 
-    config = _CONFIG.value
     train_state, logger = setup(config)
 
     train_data = create_dataloader(config, 'train')
@@ -270,7 +277,7 @@ def run(_):
             if fabric.is_global_zero:
                 progress_bar.update(1)
 
-            if k % 10 == 0:
+            if (k+1) % 10 == 0:
                 metrics = {k: fabric.all_reduce(v) for k, v in train_state.metrics.compute().items()}
                 logger.log_metrics(dict(train=metrics, lr=cur_lr), step=train_state.step)
 
@@ -286,10 +293,11 @@ def run(_):
         cp_file = cp_dir(logger) / "final_ema.pt"
         torch.save(train_state.ema_model.module, cp_file)
 
-        artifact = wandb.Artifact(name="model", type="model")
+        artifact = wandb.Artifact(name="model_"+ logger.experiment.name , type="model")
         artifact.add_file(cp_file, name="final_ema.pt")
         aliases = ["latest"]
         logger.experiment.log_model(artifact, aliases=aliases)
 
 if __name__ == "__main__":
+    torch.set_float32_matmul_precision('medium')
     app.run(run)

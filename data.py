@@ -20,8 +20,6 @@ def pad_channel(image):
     if image.shape[0] <= 3:
         image = np.moveaxis(image, 0, -1)
 
-    image = np.stack([c for c in np.moveaxis(image, -1, 0) if c.any()], axis=-1)
-
     if image.shape[-1] == 1:
         image = np.tile(image, (1, 1, 3))
     elif image.shape[-1] == 2:
@@ -86,53 +84,36 @@ def format_and_augment(example, *, imagesize = 256, augment=True):
     return dict(image=image, label=label, task_id=task_id)
 
 
-def train_process(examples, imagesize=256):
-    augmented = []
-    for example in examples:
-        augmented.append(format_and_augment(example, imagesize=imagesize))
-    
-    return torch.utils.data.default_collate(augmented)
-
-
-def test_process(examples, imagesize=256):
-    processed = []
-    for example in examples:
-        processed.append(format_and_augment(example, imagesize=imagesize, augment=False))
-
-    return torch.utils.data.default_collate(processed)
-
 def scs(config, split):
+    def collate_fn(examples):
+        augmented = []
+        for example in examples:
+            augmented.append(format_and_augment(
+                example,
+                augment=split=="train", 
+                imagesize=config.image_size)
+            )
+        
+        return torch.utils.data.default_collate(augmented)
+
     ds = (
         datasets.load_dataset(
             "jiyuuchc/scs", 
             split=split,
             token=config.token if len(config.token) > 0 else None,
         )
-        .filter(lambda x: x['src'] != "tissuenet_n")
         .with_format('numpy')
         .repeat(config.epochs_per_iter if split == 'train' else 1)
     )
 
-    if split == "train":
-        dataloader = DataLoader(
-            ds, 
-            batch_size=config.batch_size,
-            shuffle=True, 
-            collate_fn=partial(train_process, imagesize=config.image_size),
-            num_workers=config.dataloader_workers,
-            prefetch_factor=1,
-            drop_last=True,
-            pin_memory=True,
-        )
-    else:
-        dataloader = DataLoader(
-            ds, 
-            batch_size=config.batch_size,
-            shuffle=False,
-            collate_fn=partial(test_process, imagesize=config.image_size),
-            num_workers=4,
-            drop_last=True,
-            pin_memory=True,
-        )
+    dataloader = DataLoader(
+        ds, 
+        batch_size=config.batch_size,
+        shuffle=split=="train",
+        collate_fn=collate_fn,
+        num_workers=config.dataloader_workers,
+        drop_last=True,
+        pin_memory=True,
+    )
 
     return dataloader

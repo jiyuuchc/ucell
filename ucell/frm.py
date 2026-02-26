@@ -121,8 +121,8 @@ class FRM(nn.Module):
         batch = dict(image=image, task_id=torch.ones([B], dtype=torch.int32) * task_id)
 
         with torch.no_grad():
-            z = torch.zeros([B, self.config.seq_len + self.config.task_emb_len, self.config.hidden_size])
-            z_L, z_H = z[:, :self.config.task_emb_len], z[:, self.config.task_emb_len:]
+            z = torch.zeros([B, self.config.seq_len + self.config.num_z_tokens, self.config.hidden_size])
+            z_L, z_H = z[:, :self.config.num_z_tokens], z[:, self.config.num_z_tokens:]
             _, out = self(z_H, z_L, batch)
             out = out.permute(0, 2, 3, 1)
 
@@ -233,7 +233,9 @@ class FRMWrapper(nn.Module):
                 output['mask'], gt_mask, reduction="none",
             ).mean(dim=(1,2))
 
-            l2_loss = .5 * torch.square(gt_flow - output['flow']).mean(dim=(1,2,3))
+            # l2_loss = .5 * torch.square(gt_flow - output['flow']).mean(dim=(1,2,3))
+            l2_loss = .5 * torch.square(gt_flow - output['flow']) * gt_mask.unsqueeze(1)
+            l2_loss = l2_loss.mean(dim=(1,2,3))
 
             output['losses'] = dict(det_loss=det_loss, l2_loss=l2_loss)
 

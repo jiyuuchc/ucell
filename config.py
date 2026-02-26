@@ -1,4 +1,3 @@
-import random
 from ml_collections import ConfigDict
 
 def base():
@@ -9,7 +8,7 @@ def base():
     config.image_size = 256
     config.train_emb_only = False
 
-    config.seed = random.randint(0, 1000000)
+    config.seed = 42
 
     config.dataset = "scs"
     config.batch_size = 48
@@ -60,13 +59,12 @@ def get_config(cfg="default"):
         config.model.H_cycles=1
         config.model.L_cycles=2
     elif cfg == "train_emb":
-        config.halt_max_steps=3
-        config.model.H_cycles=1
+        config.halt_max_steps=1
+        config.model.H_cycles=3
         config.model.L_cycles=6
         config.train_emb_only = True
         config.opt.lr = 1e-3
-        config.opt.cosine_annealing = True
-        config.n_iters = 1
+        config.opt.warmup_steps=0
     else:
         assert cfg == 'default'
 
