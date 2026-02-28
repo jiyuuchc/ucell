@@ -73,12 +73,14 @@ class AverageMetric:
 
 def create_dataloader(config, split: str):
     import data as data_module
-    data_fn = getattr(data_module, config.dataset)
 
-    dataloader = data_fn(
+    dataloader = data_module.get_dataloader(
         config, split
     )
-    return fabric.setup_dataloaders(dataloader)
+    if dataloader is None:
+        return None
+    else:
+        return fabric.setup_dataloaders(dataloader)
 
 
 def cp_dir(logger:WandbLogger):
@@ -114,7 +116,12 @@ def resume_state(train_state, logger:WandbLogger):
     cp = fabric.load(cp_file)
 
     train_state.step = cp['step']
-    train_state.model.load_state_dict(cp['model'])
+    # when LoRA adapters have been injected the checkpoint may not contain
+    # their parameters (in case we are resuming a base model).  load with
+    # strict=False in that situation to avoid missing-key errors.
+    config = _CONFIG.value
+    strict = not (hasattr(config, "lora") and config.lora.rank > 0)
+    train_state.model.load_state_dict(cp['model'], strict=strict)
     train_state.ema_model.load_state_dict(cp['ema_model'])
     train_state.optimizer.load_state_dict(cp['optimizer'])
 
@@ -143,7 +150,28 @@ def setup(config):
     if flags.FLAGS.init is not None:
         model.load_checkpoint(flags.FLAGS.init)
 
+    # if LoRA is requested, inject adapters before freezing any parameters
+    if hasattr(config, "lora") and config.lora.rank > 0:
+        from ucell.lora import inject_lora, mark_only_lora_trainable
+
+        inject_lora(
+            model,
+            config.lora.rank,
+            config.lora.alpha,
+            config.lora.dropout,
+            config.lora.target_modules,
+        )
+        # freeze everything except LoRA weights
+        mark_only_lora_trainable(model)
+        fabric.print(
+            f"LoRA enabled (r={config.lora.rank}, alpha={config.lora.alpha}) "
+            f"on modules {config.lora.target_modules or 'ALL'}"
+        )
+
     if config.train_emb_only:
+        if hasattr(config, "lora") and config.lora.rank > 0:
+            fabric.print("WARNING: train_emb_only and LoRA are both set; "
+                         "LoRA adapters will still be trained but non-task embeddings will be frozen.")
         for name, p in model.named_parameters():
             if not "task_emb" in name:
                 p.requires_grad = False
@@ -258,7 +286,9 @@ def run(_):
     train_state, logger = setup(config)
 
     train_data = create_dataloader(config, 'train')
-    test_data = create_dataloader(config, 'test')
+    val_data = create_dataloader(config, 'validation')
+    if val_data is None:
+        warnings.warn("Cannot find validation dataset. Will skip validation")
 
     for i in range(config.n_iters):                
         train_state.metrics = AverageMetric()
@@ -283,11 +313,13 @@ def run(_):
 
         save_state(train_state, logger)
 
-        eval_metrics = evaluate(train_state.model, test_data)
-        fabric.print(f"Eval metrics: {eval_metrics}")
+        if val_data is not None:
+            eval_metrics = evaluate(train_state.model, val_data)
+            fabric.print(f"Eval metrics: {eval_metrics}")
 
-        logger.log_metrics(dict(eval=eval_metrics), step=train_state.step)
-        logger.save()
+            logger.log_metrics(dict(eval=eval_metrics), step=train_state.step)
+            logger.save()
+            
 
     if fabric.is_global_zero:
         cp_file = cp_dir(logger) / "final_ema.pt"

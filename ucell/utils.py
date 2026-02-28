@@ -71,6 +71,9 @@ def pad_channel(image):
     if image.ndim == 2:
         image = image[..., None]
 
+    if image.shape[0] <= 3 and image.shape[-1] > 3:
+        image = np.moveaxis(image, 0, -1)
+
     C = image.shape[-1]
     if C == 1:
         image = np.c_[image, image, image]
@@ -156,8 +159,15 @@ def from_patches(patches, orig_shape, *, GS=256):
         orig_shape = (1,) + tuple(orig_shape)
     
     B, H0, W0, C = orig_shape
-    
+    assert patches.shape[1:3] == (GS, GS), f"unexpected patch shape {patches.shape[1:3]}"
+
     overlap = GS // 8
+    sl = np.linspace(.1, 1, overlap//2, endpoint=False)
+    weights = np.ones((GS, GS))
+    weights[:, :overlap//2] *= sl
+    weights[:, -overlap//2:] *= sl[::-1]
+    weights[:overlap//2, :] *= sl[:, None]
+    weights[-overlap//2:, :] *= sl[::-1][:, None]
     
     def _from_patches(section):
         H, W = max(H0, GS), max(W0, GS)
@@ -170,8 +180,8 @@ def from_patches(patches, orig_shape, *, GS=256):
                 if yc + GS > H: yc = H - GS
                 if xc + GS > W: xc = W - GS
 
-                cnts[yc:yc+GS, xc:xc+GS] += 1
-                y[yc:yc+GS, xc:xc+GS] += section[k]
+                cnts[yc:yc+GS, xc:xc+GS] += weights[..., None]
+                y[yc:yc+GS, xc:xc+GS] += section[k] * weights[..., None]
                 k += 1
 
         y = (y / cnts)[:H0, :W0, :]
@@ -189,7 +199,7 @@ def from_patches(patches, orig_shape, *, GS=256):
     return y
 
 
-def patcherize(fn=None, *, GS=256, B=16):
+def patcherize(fn=None, *, GS=256, B=-1):
     """ wraps a image processing fuction whose input needs be a 4d tensor of specific dim, ie. image patchs.
         The functon should return a ndarray of the same shape as input
     Args:
@@ -205,14 +215,19 @@ def patcherize(fn=None, *, GS=256, B=16):
         orig_shape = x.shape
 
         x_patches = to_patches(x, GS=GS)
-
         n_patches = x_patches.shape[0]
-        pad_to = (n_patches - 1) // B * B + B
-        x_patches = np.pad(x_patches, [[0, pad_to - n_patches], [0, 0], [0, 0], [0, 0]])
+
+        if B > 0:
+            pad_to = (n_patches - 1) // B * B + B
+            x_patches = np.pad(x_patches, [[0, pad_to - n_patches], [0, 0], [0, 0], [0, 0]])
+            bs = B
+        else:
+            pad_to = n_patches
+            bs = n_patches
 
         y_patches = []
-        for k in range(0, pad_to, B):
-            y_patches.append(np.asarray(fn(x_patches[k:k+B], *args, **kwargs)))
+        for k in range(0, pad_to, bs):
+            y_patches.append(np.asarray(fn(x_patches[k:k+bs], *args, **kwargs)))
 
         y_patches = np.concatenate(y_patches)
 

@@ -198,3 +198,4 @@ run/
 wandb/
 checkpoints/
 predictions/
+analyses/

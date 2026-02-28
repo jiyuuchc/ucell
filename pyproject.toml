@@ -28,6 +28,10 @@ train = [
     "torchvision",
     "datasets",
 ]
+analysis = [
+    "umap-learn",
+    "matplotlib",
+]
 
 [project.urls]
 "Source Code" = "https://github.com/jiyuuchc/ucell"

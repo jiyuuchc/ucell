@@ -163,11 +163,15 @@ class SwiGLU(nn.Module):
         super().__init__()
         inter = _find_multiple(round(expansion * hidden_size * 2 / 3), 256)
 
-        self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
-        self.down_proj    = CastedLinear(inter, hidden_size, bias=False)
+        # self.gate_up_proj = CastedLinear(hidden_size, inter * 2, bias=False)
+        self.gate_proj = CastedLinear(hidden_size, inter, bias=False)
+        self.up_proj = CastedLinear(hidden_size, inter, bias=False)
+        self.down_proj = CastedLinear(inter, hidden_size, bias=False)
 
     def forward(self, x):
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        # gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
 
 def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tensor:

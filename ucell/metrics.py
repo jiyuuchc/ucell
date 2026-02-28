@@ -122,12 +122,27 @@ class LabelMetrics:
 
 
     def update(self, pred_mask, gt_mask):
+        # handle possible negative value (ignore) in gt_mask
+        if gt_mask.min() < 0:
+            max_label = gt_mask.max()
+            gt_mask[gt_mask < 0] = max_label + 1
+            has_ignore = True
+        else:
+            has_ignore = False
+
         pred_rps = regionprops(pred_mask)
         gt_rps = regionprops(gt_mask)
 
         mask_its = mask_intersection(pred_rps, gt_rps)
         pred_areas = np.array([rp.area_filled for rp in pred_rps]).reshape(-1)
         gt_areas = np.array([rp.area_filled for rp in gt_rps]).reshape(-1)
+
+        if has_ignore:
+            # find predictions within the ignored region
+            mostly_in_ignored_region = (mask_its[:, -1] / pred_areas) >= .5
+            mask_its = mask_its[ ~ mostly_in_ignored_region ][:, :-1]
+            pred_areas = pred_areas[ ~ mostly_in_ignored_region ]
+            gt_areas = gt_areas[:-1]
 
         pred_scores, gt_scores, ious = self._update(mask_its, pred_areas, gt_areas)
 
@@ -166,26 +181,17 @@ class LabelMetrics:
             recall = n_tps / n_gts if n_gts > 0 else float('nan'),
             f1 = (2 * n_tps) / (n_preds + n_gts) if n_gts + n_preds > 0 else float('nan'),
             instance_dice = dice,
+            pred_dice = pred_dice,
+            gt_dice = gt_dice,
+            pred_total_area = pred_areas.sum(),
+            gt_total_area = gt_areas.sum(),
             ap = n_tps /(n_gts + n_preds - n_tps) if n_gts + n_preds > 0 else float('nan'),
         )
     
-    def compute(self, iou_threshold=.5, micros=False):
+    def compute(self, iou_threshold=.5):
         if len(self.pred_areas) == 0:
             return None
-        # micro stats
-        if micros:
-            micros = []
-            for k in range(len(self.pred_areas)):
-                micros.append(self._compute(
-                    self.gt_areas[k],
-                    self.pred_areas[k], 
-                    self.gt_scores[k],
-                    self.pred_scores[k],
-                    self.ious[k],
-                    iou_threshold,
-                ))
 
-        # macro stats
         pred_areas = np.concatenate(self.pred_areas)
         pred_scores = np.concatenate(self.pred_scores)
         gt_areas = np.concatenate(self.gt_areas)
@@ -194,8 +200,4 @@ class LabelMetrics:
 
         macros = self._compute(gt_areas, pred_areas, gt_scores, pred_scores, ious, iou_threshold)
 
-        if micros:
-            return macros, micros
-        else:
-            return macros
-
+        return macros

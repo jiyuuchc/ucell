@@ -11,8 +11,7 @@ IGNORE_LABEL_ID = -100
 
 @dataclass
 class FrmCarry:
-    z_H: torch.Tensor    
-    z_L: torch.Tensor    
+    z: torch.Tensor
     steps: torch.Tensor
     halted: torch.Tensor
     current_data: dict
@@ -90,29 +89,27 @@ class FRM(nn.Module):
         # Scale
         return math.sqrt(self.config.hidden_size) * embedding, shape_2d
     
-    def forward(self, z_H, z_L, batch):
+    def forward(self, z, batch):
         # Input encoding
         input_embeddings, (h, w) = self._input_embeddings(batch["image"], batch["task_id"])
 
         D = self.config.num_z_tokens
 
-        def L_level(z_H, z_L):
-            z = torch.concat([z_L, z_H], dim=1)
-            for _ in range(self.config.L_cycles + 1):
+        def L_level(z):
+            for _ in range(self.config.L_cycles):
                 z = self.transformer(z + input_embeddings)
-            z_L, z_H = z[:, :D], z[:, D:]
-            return z_H, z_L
+            return z
 
         # Forward iterations
         with torch.no_grad():
             for _ in range(self.config.H_cycles-1):
-                z_H, z_L = L_level(z_H, z_L)
-        z_H, z_L = L_level(z_H, z_L)
+                z = L_level(z)
+        z = L_level(z)
 
         # LM Outputs
-        output = self.lm_head(rearrange(z_H, "b (h w) c -> b c h w", h=h, w=w))
+        output = self.lm_head(rearrange(z[:, D:], "b (h w) c -> b c h w", h=h, w=w))
 
-        return (z_H, z_L), output
+        return z, output
 
     def predict(self, inputs, task_id=0):
         B, H, W, C = inputs.shape
@@ -122,23 +119,119 @@ class FRM(nn.Module):
 
         with torch.no_grad():
             z = torch.zeros([B, self.config.seq_len + self.config.num_z_tokens, self.config.hidden_size])
-            z_L, z_H = z[:, :self.config.num_z_tokens], z[:, self.config.num_z_tokens:]
-            _, out = self(z_H, z_L, batch)
+            _, out = self(z, batch)
             out = out.permute(0, 2, 3, 1)
 
         return out.detach().cpu().numpy()
 
-    
-    def load_state_dict(self, state_dict, strict=True):
-        # remove unnecessary key prefixes (e.g., "module.") added by FrmWrapper, EMA or fabric
+    @staticmethod
+    def _strip_state_dict_prefixes(state_dict):
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith("module."):
                 k = k[len("module."):]
             if k.startswith("inner."):
                 k = k[len("inner."):]
+
             new_state_dict[k] = v
-        
+        return new_state_dict
+
+    @staticmethod
+    def _split_legacy_fused_layers(state_dict):
+        """Split legacy fused gate_up_proj weights into separate gate_proj /
+        up_proj tensors expected by the current SwiGLU architecture.
+        This must run *after* LoRA merging so that any adapter contributions
+        are already folded into the weight before the split.
+        """
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if "gate_up_proj" in k:
+                gate_weight, up_weight = v.chunk(2, dim=0)
+                new_state_dict[k.replace("gate_up_proj", "gate_proj")] = gate_weight
+                new_state_dict[k.replace("gate_up_proj", "up_proj")] = up_weight
+            else:
+                new_state_dict[k] = v
+        return new_state_dict
+
+    @staticmethod
+    def _merge_lora_weights(state_dict, default_lora_scaling=None):
+        merged_state_dict = {}
+        lora_bases = set()
+
+        for key in state_dict.keys():
+            if key.endswith(".orig.weight"):
+                base = key[:-len(".orig.weight")]
+                if (
+                    f"{base}.lora_A" in state_dict
+                    and f"{base}.lora_B" in state_dict
+                ):
+                    lora_bases.add(base)
+
+        for key, value in state_dict.items():
+            if key.endswith(".orig.weight"):
+                base = key[:-len(".orig.weight")]
+                if base in lora_bases:
+                    lora_a = state_dict[f"{base}.lora_A"]
+                    lora_b = state_dict[f"{base}.lora_B"]
+
+                    scaling_key = f"{base}.scaling"
+                    alpha_key = f"{base}.alpha"
+                    rank_key = f"{base}.r"
+                    if scaling_key in state_dict:
+                        scaling = state_dict[scaling_key]
+                    elif alpha_key in state_dict and rank_key in state_dict:
+                        scaling = state_dict[alpha_key] / state_dict[rank_key]
+                    else:
+                        if default_lora_scaling is not None:
+                            scaling = default_lora_scaling
+                        else:
+                            raise ValueError(
+                                "LoRA checkpoint is missing scaling metadata "
+                                f"for '{base}'. Provide default_lora_scaling "
+                                "when loading older checkpoints."
+                            )
+
+                    lora_a = lora_a.to(device=value.device, dtype=value.dtype)
+                    lora_b = lora_b.to(device=value.device, dtype=value.dtype)
+                    if torch.is_tensor(scaling):
+                        scaling = scaling.to(device=value.device, dtype=value.dtype)
+
+                    delta = torch.matmul(
+                        lora_b,
+                        lora_a,
+                    )
+                    merged_state_dict[f"{base}.weight"] = value + (delta * scaling)
+                else:
+                    merged_state_dict[f"{base}.weight"] = value
+            elif key.endswith(".lora_A") or key.endswith(".lora_B"):
+                continue
+            elif key.endswith(".scaling") or key.endswith(".alpha") or key.endswith(".r"):
+                continue
+            else:
+                merged_state_dict[key] = value
+
+        if lora_bases:
+            warnings.warn(
+                "Detected LoRA checkpoint keys and merged adapters into base "
+                "weights for loading.")
+
+        return merged_state_dict
+
+    
+    def load_state_dict(self, state_dict, strict=True, default_lora_scaling=None):
+        # remove unnecessary key prefixes (e.g., "module.") added by FrmWrapper, EMA or fabric
+        new_state_dict = self._strip_state_dict_prefixes(state_dict)
+
+        # merge LoRA adapter weights when loading checkpoints produced from LoRA training
+        new_state_dict = self._merge_lora_weights(
+            new_state_dict,
+            default_lora_scaling=default_lora_scaling,
+        )
+
+        # split legacy fused gate_up_proj into gate_proj + up_proj (must be
+        # after LoRA merging so adapters are already folded in)
+        new_state_dict = self._split_legacy_fused_layers(new_state_dict)
+
         # if embedding dim mismatch, give a warning and load only the rest of the state
         model_state_dict = self.state_dict()
         for k in model_state_dict.keys():
@@ -149,24 +242,33 @@ class FRM(nn.Module):
         super().load_state_dict(new_state_dict, strict=strict)
 
 
-    def load_checkpoint(self, checkpoint, strict=True):
+    def load_checkpoint(self, checkpoint, default_lora_scaling=None):
         # checkpoint can be a path or a path:key where key specifies which part of the checkpoint to load as model state dict
         if ":" in str(checkpoint):
             cp_path, key = str(checkpoint).split(":")
         else:
             cp_path, key = str(checkpoint), 'model'
 
-        cp = torch.load(cp_path, weights_only=False)
+        cp = torch.load(cp_path, weights_only=False, map_location="cpu")
+        is_module_or_state_dict = False
 
         if isinstance(cp, torch.nn.Module):
             cp = cp.state_dict()
+            is_module_or_state_dict = True
+        elif isinstance(cp, dict) and all(isinstance(v, torch.Tensor) for v in cp.values()):
+            is_module_or_state_dict = True
         
         if key in cp:
             cp = cp[key]
         else:
-            warnings.warn(f"Key '{key}' not found in checkpoint {cp_path}. Attempting to load entire checkpoint as model state dict.")
+            if not is_module_or_state_dict:
+                warnings.warn(f"Key '{key}' not found in checkpoint {cp_path}. Attempting to load entire checkpoint as model state dict.")
 
-        self.load_state_dict(cp, strict=strict)
+        self.load_state_dict(
+            cp,
+            strict=key != "ema_model",
+            default_lora_scaling=default_lora_scaling,
+        )
 
 
 class FRMWrapper(nn.Module):
@@ -178,18 +280,13 @@ class FRMWrapper(nn.Module):
     def initial_carry(self, batch):
         model_cfg = self.config.model
         t_ = batch["task_id"]
-        z_H = torch.tile(
+        z = torch.tile(
             torch.zeros_like(t_[:, None, None], dtype=self.inner.dtype),
-            (1, model_cfg.seq_len, model_cfg.hidden_size)
-        )
-        z_L = torch.tile(
-            torch.zeros_like(t_[:, None, None], dtype=self.inner.dtype),
-            (1, model_cfg.num_z_tokens, model_cfg.hidden_size)
+            (1, model_cfg.seq_len + model_cfg.num_z_tokens, model_cfg.hidden_size)
         )
 
         return FrmCarry(
-            z_H = z_H,
-            z_L = z_L,
+            z = z,
             steps=torch.zeros_like(t_),
             halted=torch.zeros_like(t_, dtype=torch.bool), 
             current_data=batch,
@@ -200,8 +297,7 @@ class FRMWrapper(nn.Module):
         new_carry = self.initial_carry(batch)
         replace_halted = lambda x, y: torch.where(halted.view((-1,) + (1,) * (x.ndim - 1)) ,x, y)
         return FrmCarry(
-            z_H = replace_halted(new_carry.z_H, carry.z_H),
-            z_L = replace_halted(new_carry.z_L, carry.z_L),
+            z = replace_halted(new_carry.z, carry.z),
             steps = replace_halted(new_carry.steps, carry.steps),
             halted = torch.zeros_like(halted),
             current_data = {
@@ -216,7 +312,7 @@ class FRMWrapper(nn.Module):
         carry = self.reset_carry(carry, batch)
         batch = carry.current_data
 
-        (z_H, z_L), output = self.inner(carry.z_H, carry.z_L, batch)
+        z, output = self.inner(carry.z, batch)
 
         output = dict(flow = output[:, :2], mask = output[:, 2])
 
@@ -233,8 +329,7 @@ class FRMWrapper(nn.Module):
                 output['mask'], gt_mask, reduction="none",
             ).mean(dim=(1,2))
 
-            # l2_loss = .5 * torch.square(gt_flow - output['flow']).mean(dim=(1,2,3))
-            l2_loss = .5 * torch.square(gt_flow - output['flow']) * gt_mask.unsqueeze(1)
+            l2_loss = .5 * torch.square(gt_flow - output['flow']) * (gt_flow != 0).any(dim=1, keepdim=True)
             l2_loss = l2_loss.mean(dim=(1,2,3))
 
             output['losses'] = dict(det_loss=det_loss, l2_loss=l2_loss)
@@ -254,14 +349,21 @@ class FRMWrapper(nn.Module):
                 }
 
         output['carry'] = FrmCarry(
-                z_H = z_H.detach(),
-                z_L = z_L.detach(),
-                steps = steps,
-                halted = halted,
-                current_data=batch,
-            )
+            z = z.detach(),
+            steps = steps,
+            halted = halted,
+            current_data=batch,
+        )
         
         return output
 
-    def load_checkpoint(self, checkpoint, strict=True):
-        self.inner.load_checkpoint(checkpoint, strict=strict)
+    def load_checkpoint(self, checkpoint, default_lora_scaling=None):
+        if default_lora_scaling is None:
+            if hasattr(self.config, "lora") and self.config.lora.rank > 0:
+                default_lora_scaling = (
+                    self.config.lora.alpha / self.config.lora.rank
+                )
+        self.inner.load_checkpoint(
+            checkpoint,
+            default_lora_scaling=default_lora_scaling,
+        )
