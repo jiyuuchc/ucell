@@ -31,7 +31,7 @@ def base():
     config.model.num_task_emb_tokens = 64
     config.model.depth = 2
     config.model.num_heads = config.model.get_ref('hidden_size')//64
-    config.model.num_tasks = 26
+    config.model.num_tasks = 5
     config.model.seq_len = (config.get_ref("image_size") // config.model.get_ref('patch_size')) ** 2
     config.model.H_cycles = 1
     config.model.L_cycles = 21
