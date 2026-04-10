@@ -14,15 +14,15 @@ dependencies = [
     "einops",
     "scikit-image",
     "fastremap",
-]
+    "ml_collections",
+    "tqdm",
+ ]
 
 [project.optional-dependencies]
 testing = [
     "pytest",
 ]
 train = [
-    "ml_collections",
-    "tqdm",
     "lightning",
     "wandb",
     "torchvision",
