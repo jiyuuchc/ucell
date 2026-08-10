@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from pathlib import Path
 import random
 import datasets
@@ -5,10 +6,38 @@ from ml_collections import ConfigDict
 import numpy as np
 import tifffile
 import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from skimage.measure import regionprops
 from ucell.utils import pad_channel
+
+
+@contextmanager
+def rank_zero_first():
+    '''Run the body on rank 0 before any other rank enters it.
+
+    datasets' .map()/.filter() write a cache file next to the dataset. If every
+    rank builds a cold cache at once they race, and a rank that mmaps a region
+    another rank is still writing dies with SIGBUS. Letting rank 0 build the
+    cache first means the other ranks only ever read a finished file.
+
+    A no-op when torch.distributed is not initialized, so single-process
+    callers are unaffected.
+    '''
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+
+    if distributed and rank != 0:
+        dist.barrier()  # wait for rank 0 to finish building the cache
+
+    try:
+        yield
+    finally:
+        # in a finally so a failure on rank 0 releases the others rather than
+        # hanging them at the barrier forever
+        if distributed and rank == 0:
+            dist.barrier()
 
 def random_flip(image, label):
     if random.random() >= .5:
@@ -125,37 +154,42 @@ def load_img_folder(config, split):
     
     p = Path(config.data_dir) / split
     if p.exists():
-        if (p/"dataset_info.json").exists():
-            ds = (
-                datasets.load_from_disk(p)
-                .map(compute_label, writer_batch_size=16, num_proc=0)
-            )
+        # rank 0 builds the map/filter cache first; the other ranks then read
+        # the finished file instead of racing to write it
+        with rank_zero_first():
+            if (p/"dataset_info.json").exists():
+                ds = (
+                    datasets.load_from_disk(p)
+                    .map(compute_label, writer_batch_size=16, num_proc=0)
+                )
 
-        elif (p/"metadata.csv").exists():
-            ds = (
-                datasets.load_dataset(str(p), split="train")
-                .map(compute_label, writer_batch_size=16, num_proc=0)
-                .remove_columns("masks")
-            )
+            elif (p/"metadata.csv").exists():
+                ds = (
+                    datasets.load_dataset(str(p), split="train")
+                    .map(compute_label, writer_batch_size=16, num_proc=0)
+                    .remove_columns("masks")
+                )
 
-        else:
-            mask_fns = list(p.glob("*_label.tif"))
-            img_fns = [fn.with_name(fn.name.replace("_label", "")) for fn in mask_fns]
-            szs = [get_sz(fn) for fn in mask_fns]
+            else:
+                # Sorted so every rank builds the same dataset, and therefore
+                # the same cache fingerprint, as rank 0
+                mask_fns = sorted(p.glob("*_label.tif"))
+                img_fns = [fn.with_name(fn.name.replace("_label", "")) for fn in mask_fns]
+                szs = [get_sz(fn) for fn in mask_fns]
 
-            ds = (
-                datasets.Dataset.from_dict({
-                    "image": [str(fn) for fn in img_fns],
-                    "masks": [str(fn) for fn in mask_fns],
-                    "sz": szs,
-                    "task_id": [config.task_id] * len(img_fns),
-                })
-                .cast_column("image", datasets.features.Image())
-                .cast_column("masks", datasets.features.Image())
-                .filter(lambda x: np.array(x['masks']).max() > 0)
-                .map(compute_label, writer_batch_size=16, num_proc=0, load_from_cache_file=True)
-                .remove_columns("masks")
-            )
+                ds = (
+                    datasets.Dataset.from_dict({
+                        "image": [str(fn) for fn in img_fns],
+                        "masks": [str(fn) for fn in mask_fns],
+                        "sz": szs,
+                        "task_id": [config.task_id] * len(img_fns),
+                    })
+                    .cast_column("image", datasets.features.Image())
+                    .cast_column("masks", datasets.features.Image())
+                    .filter(lambda x: np.array(x['masks']).max() > 0)
+                    .map(compute_label, writer_batch_size=16, num_proc=0, load_from_cache_file=True)
+                    .remove_columns("masks")
+                )
 
         if config.task_id == -1:
             ds = ds.remove_columns("task_id")

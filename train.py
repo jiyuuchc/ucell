@@ -14,6 +14,7 @@ from absl import app, flags
 from ml_collections import config_flags
 from tqdm import tqdm
 from lightning.fabric import Fabric
+from lightning.fabric.strategies import DDPStrategy
 from wandb.integration.lightning.fabric import WandbLogger
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 
@@ -31,7 +32,28 @@ except KeyError:
     warnings.warn("Not running within a Slurm job. Assuming one node")
     num_nodes = 1
 
-fabric = Fabric(precision="bf16-mixed", num_nodes=num_nodes)
+# static_graph=True pins DDP's gradient bucketing after the first iteration
+# instead of rebuilding it from the observed gradient-ready order.
+#
+# Without it, runs intermittently die during iteration 1 with a NCCL collective
+# timeout in which the ranks are off by one collective -- e.g. rank 2 waiting in
+# WorkNCCL(SeqNum=206, ALLREDUCE, 5899008) while ranks 0/1 wait in
+# WorkNCCL(SeqNum=207, BROADCAST, 131072). 5899008 is a gradient bucket and
+# 131072 is the RoPE cos/sin buffer DDP broadcasts each forward, so the two
+# groups are matching different operations against each other: the per-rank
+# collective *counts* have diverged and stay permanently offset.
+#
+# DDP rebuilds its buckets from the order gradients become ready in the first
+# iteration, and torch.compile (applied at fabric.setup below) can produce a
+# different ready-order per rank when recompilation timing differs between
+# nodes. That fits the observed signature: always iteration 1, never later, and
+# only on some allocations. static_graph makes the bucket layout fixed and
+# identical everywhere.
+fabric = Fabric(
+    precision="bf16-mixed",
+    num_nodes=num_nodes,
+    strategy=DDPStrategy(static_graph=True),
+)
 
 @dataclass
 class TrainState:
