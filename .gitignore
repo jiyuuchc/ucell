@@ -199,3 +199,16 @@ wandb/
 checkpoints/
 predictions/
 analyses/
+
+# Model checkpoints
+*.pt
+
+# Notebooks
+*.ipynb
+
+# Slurm job output
+slurm-*.out
+slurm-*.err
+
+# Logs
+logs/
