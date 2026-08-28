@@ -12,7 +12,7 @@ Recursion depth is a free parameter at inference and need not match the
 schedule a checkpoint was trained under. The released checkpoints ship at
 21 recursions (`H_cycles=1`, `L_cycles=21`), which is the setting all
 reported results use. Fewer recursions trade accuracy for speed:
-`model.inner.config.L_cycles = 7` runs three times shallower.
+`overrides={"model.L_cycles": 7}` runs three times shallower.
 
 ## Requirements
 
@@ -74,11 +74,12 @@ Pretrained checkpoints live on the Hugging Face Hub at
 
 | file | size | hidden size |
 | --- | --- | --- |
-| `ucell-768.pt`  | 59 MB  | 768  |
-| `ucell-1024.pt` | 106 MB | 1024 |
+| `ucell-768.pt`  | 56 MB  | 768  |
+| `ucell-1024.pt` | 101 MB | 1024 |
 
-Both are pickled `FRMWrapper` modules, so they carry their own configuration
-and need no config file to load. Download them with the CLI or from Python:
+Each file holds a `config` and a `state_dict`, so it carries its own
+configuration and needs no config file to load — `FRMWrapper.from_checkpoint`
+reads both. Download them with the CLI or from Python:
 
 ```bash
 huggingface-cli download jiyuuchc/ucell ucell-768.pt
@@ -95,14 +96,16 @@ import torch
 from huggingface_hub import hf_hub_download
 
 from ucell.dynamics import compute_masks
+from ucell.frm import FRMWrapper
 from ucell.utils import pad_channel, patcherize
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 1. Weights.  Pickled FRMWrapper modules carry their own config,
-#    already set to the 21-recursion inference schedule.
+# 1. Weights.  The checkpoint carries its own config, already set to the
+#    21-recursion inference schedule.  Pass `overrides` to change it, e.g.
+#    overrides={"model.L_cycles": 7} for a shallower, faster pass.
 weights = hf_hub_download("jiyuuchc/ucell", "ucell-768.pt")
-model = torch.load(weights, weights_only=False, map_location=DEVICE).eval()
+model = FRMWrapper.from_checkpoint(weights).eval().to(DEVICE)
 
 # 2. Image.  Any 2D or channel-first multichannel array, scaled to [0, 1]
 #    and padded to the three channels the patch embedding expects.

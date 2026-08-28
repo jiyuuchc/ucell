@@ -1,6 +1,7 @@
 import warnings
 from dataclasses import dataclass
 import math
+import ml_collections
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -447,3 +448,61 @@ class FRMWrapper(nn.Module):
             checkpoint,
             default_lora_scaling=default_lora_scaling,
         )
+
+    def export(self, path):
+        """Write a portable checkpoint: the config plus a plain state dict.
+
+        `torch.save(model)` pickles the module object, which bakes the module
+        layout into the file: a later refactor -- self.transformer going from
+        nn.Sequential to nn.ModuleList, say -- then breaks every checkpoint
+        ever written, because unpickling restores the old structure and calls
+        the new code against it.  Storing tensors and configuration instead
+        means only the parameter *names* have to stay stable, which they have.
+
+        It also leaves the config inspectable and editable, rather than frozen
+        inside a pickled object graph, and drops the stale non-persistent
+        buffers a pickle carries (the rope tables are rebuilt on load).
+        """
+        torch.save(
+            {"config": self.config.to_dict(), "state_dict": self.state_dict()},
+            path,
+        )
+
+    @classmethod
+    def from_checkpoint(cls, path, overrides=None, **kwargs):
+        """Build a model from a checkpoint, using the config it carries.
+
+        `overrides` is a flat dict of dotted config paths applied on top of
+        the stored config, e.g. {"model.L_cycles": 21}.  Recursion depth is
+        deliberately not the same during training and inference, so callers
+        override it as a matter of course rather than as an escape hatch.
+
+        Pickled FRMWrapper objects (the older export format) are accepted too,
+        so callers need not know which format a file is in.  Training
+        checkpoints -- the Fabric dicts with `step`/`model`/`optimizer` keys --
+        carry no config; build the model yourself and use load_checkpoint().
+        """
+        blob = torch.load(path, weights_only=False, map_location="cpu")
+
+        if isinstance(blob, cls):
+            if overrides:
+                blob.config.update_from_flattened_dict(dict(overrides))
+            return blob
+
+        if not (isinstance(blob, dict)
+                and "config" in blob and "state_dict" in blob):
+            raise ValueError(
+                f"{path} carries no config: it is neither a portable "
+                f"checkpoint (config + state_dict) nor a pickled FRMWrapper. "
+                f"Construct the model from a config and use load_checkpoint()."
+            )
+
+        config = ml_collections.ConfigDict(blob["config"])
+        if overrides:
+            config.update_from_flattened_dict(dict(overrides))
+
+        model = cls(config)
+        model.inner.load_state_dict(
+            FRM._strip_state_dict_prefixes(blob["state_dict"]), **kwargs
+        )
+        return model
