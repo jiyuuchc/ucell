@@ -197,27 +197,103 @@ def load_img_folder(config, split):
     return ds
 
 
+class WeightedDistributedSampler(torch.utils.data.Sampler):
+    """Sample images with per-task weights, sharding across ranks itself.
+
+    The training set is a concatenation of subsets of very unequal size, so
+    uniform shuffling shows each subset in proportion to its image count --
+    livecell 41% of batches against monusac's 2.7%.  Weighting each image by
+    `n_images_in_its_task ** -alpha` corrects that: alpha=0 leaves the natural
+    proportions, alpha=1 gives every task an equal share, and values between
+    interpolate.
+
+    Full balancing is rarely what you want here.  Equalising a 209-image subset
+    against a 3189-image one means repeating each of those 209 roughly 15 times
+    per epoch, which overfits them long before the large subsets converge.
+
+    This sampler shards by rank on its own rather than being wrapped in a
+    DistributedSampler, so callers must pass use_distributed_sampler=False to
+    fabric.setup_dataloaders.  All ranks draw from one generator seeded
+    identically and then take disjoint strides of the result, so the global
+    draw is consistent and no index is handed to two ranks.
+    """
+
+    def __init__(self, weights, num_samples, seed=0):
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        distributed = dist.is_available() and dist.is_initialized()
+        self.world_size = dist.get_world_size() if distributed else 1
+        self.rank = dist.get_rank() if distributed else 0
+        # floor, so every rank yields the same count and no rank runs short
+        self.num_samples = num_samples // self.world_size
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self):
+        return self.num_samples
+
+    def __iter__(self):
+        g = torch.Generator()
+        # bumped per pass so successive epochs differ; every rank calls
+        # __iter__ the same number of times, so the seeds stay in step
+        g.manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        idx = torch.multinomial(
+            self.weights, self.num_samples * self.world_size,
+            replacement=True, generator=g,
+        )
+        yield from idx[self.rank::self.world_size].tolist()
+
+
+def task_weights(task_ids, alpha):
+    """Per-image sampling weight, flattening the task histogram by alpha."""
+    task_ids = np.asarray(task_ids)
+    tasks, counts = np.unique(task_ids, return_counts=True)
+    per_task = counts.astype("float64") ** (-alpha)
+    return per_task[np.searchsorted(tasks, task_ids)]
+
+
 def get_dataloader(config:"ConfigDict", split:str)->DataLoader|None:
+    collapse = config.get("collapse_task_id", -1)
+
     def collate_fn(examples):
         augmented = []
         for example in examples:
-            augmented.append(format_and_augment(
+            out = format_and_augment(
                 example,
                 augment=split=="train", 
                 imagesize=config.image_size,
-            ))
+            )
+            if collapse >= 0:
+                # the dataset's own task_id still drives the sampler weights;
+                # only what the model is told is overridden
+                out["task_id"] = collapse
+            augmented.append(out)
         return torch.utils.data.default_collate(augmented)
 
     ds = load_img_folder(config, split)
     if ds is None:
         return None
 
-    ds = ds.with_format('numpy').repeat(config.epochs_per_iter if split == 'train' else 1)
+    alpha = config.get("sampling_alpha", 0.0)
+    weights = None
+    if split == "train" and alpha > 0 and "task_id" in ds.column_names:
+        # read before .repeat() so only one copy is materialized, then tile
+        weights = task_weights(ds.select_columns(["task_id"])["task_id"], alpha)
+
+    repeats = config.epochs_per_iter if split == "train" else 1
+    ds = ds.with_format('numpy').repeat(repeats)
+
+    sampler = None
+    if weights is not None:
+        sampler = WeightedDistributedSampler(
+            np.tile(weights, repeats), len(ds), seed=config.seed,
+        )
 
     dataloader = DataLoader(
         ds, 
         batch_size=config.batch_size,
-        shuffle=split=="train",
+        shuffle=split == "train" and sampler is None,
+        sampler=sampler,
         collate_fn=collate_fn,
         num_workers=config.dataloader_workers,
         drop_last=True,

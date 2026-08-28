@@ -9,6 +9,15 @@ def base():
     config.ema_decay = 0.999
     config.image_size = 256
     config.task_id = 0
+    # Per-task sampling weight exponent, applied to the training set only.
+    # 0 = natural subset proportions, 1 = every task equally likely.  See
+    # data.WeightedDistributedSampler for why the middle is the useful range.
+    config.sampling_alpha = 0.5
+    # >= 0 makes every sample report this task_id to the model, whatever the
+    # dataset says.  Used to train one shared task embedding across all
+    # subsets: the sampler still sees the real ids, so sampling_alpha keeps
+    # balancing them, but only this row of task_emb ever receives gradient.
+    config.collapse_task_id = -1
 
     config.data_dir = "dataset"
     config.batch_size = 64 # per gpu. Total batch size is batch_size * num_gpus.
@@ -26,9 +35,16 @@ def base():
     config.model.patch_size = 8
     config.model.forward_dtype="bfloat16"
     config.model.pos_emb="rope"
-    config.model.hidden_size = 1024
+    config.model.hidden_size = 768
     config.model.num_z_tokens = 64
     config.model.num_task_emb_tokens = 64
+    # Normalise each task-embedding token where it is used.  The table feeds
+    # `z + input_embeddings` unnormalised (the blocks are post-norm, so they
+    # only normalise after the residual), which leaves its radial direction
+    # nearly flat: with weight decay on, row scale is pinned by the decay
+    # rather than by the loss; with decay off, Adam's scale-free step lets it
+    # drift without bound.  Normalising makes that direction unidentifiable.
+    config.model.norm_task_emb = False
     config.model.depth = 2
     config.model.num_heads = config.model.get_ref('hidden_size')//64
     config.model.num_tasks = 5

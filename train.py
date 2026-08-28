@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
 
 from absl import app, flags
 from ml_collections import config_flags
@@ -18,7 +17,7 @@ from lightning.fabric.strategies import DDPStrategy
 from wandb.integration.lightning.fabric import WandbLogger
 from torch.optim.swa_utils import AveragedModel, get_ema_avg_fn
 
-from ucell.frm import FRMWrapper
+from ucell.frm import FRM, FRMWrapper
 
 flags.DEFINE_string("resume", None, "resume a stopped run")
 flags.DEFINE_string("dir", "checkpoints", "checkpointing location")
@@ -102,7 +101,14 @@ def create_dataloader(config, split: str):
     if dataloader is None:
         return None
     else:
-        return fabric.setup_dataloaders(dataloader)
+        # WeightedDistributedSampler shards across ranks itself; letting fabric
+        # wrap it in a DistributedSampler would discard the weights.
+        return fabric.setup_dataloaders(
+            dataloader,
+            use_distributed_sampler=not isinstance(
+                dataloader.sampler, data_module.WeightedDistributedSampler
+            ),
+        )
 
 
 def cp_dir(logger:WandbLogger):
@@ -163,6 +169,49 @@ def setup_logging(config):
     return logger
 
 
+def param_groups(config, model):
+    """Trainable parameters, split so weight decay skips anything whose scale
+    the forward pass cannot see.
+
+    With `norm_task_emb` the task embedding table holds only a direction: it is
+    rms_norm'd where it is used, so its magnitude never reaches the output and
+    nothing in the loss opposes decay shrinking it.  Left in the decayed group
+    it shrinks unopposed at lr*wd until it reaches rms_norm's epsilon floor,
+    which a long run does reach.  Conditioning strength lives in
+    `task_emb_gain` instead, which stays decayed because there the decay acts
+    on something the model can actually feel.
+
+    With the flag off (the default) this returns one flat group, leaving the
+    optimizer state layout -- and `--resume` on existing runs -- as it was.
+    """
+    trainable = [
+        (n, p) for n, p in model.named_parameters() if p.requires_grad
+    ]
+    flat = [p for _, p in trainable]
+
+    if not getattr(config.model, "norm_task_emb", False):
+        return flat
+
+    def is_direction(name):
+        return name.endswith(FRM.TASK_EMB_KEY)
+
+    undecayed = [p for n, p in trainable if is_direction(n)]
+    decayed = [p for n, p in trainable if not is_direction(n)]
+    if not undecayed or not decayed:
+        # nothing to split (e.g. everything but the table is frozen); keep the
+        # single-group layout rather than handing AdamW an empty group
+        return flat
+
+    fabric.print(
+        f"norm_task_emb: excluding {len(undecayed)} task embedding direction "
+        f"tensor(s) from weight decay ({len(decayed)} tensors still decayed)"
+    )
+    return [
+        {"params": decayed},
+        {"params": undecayed, "weight_decay": 0.0},
+    ]
+
+
 def setup(config):
     logger = setup_logging(config)
 
@@ -200,7 +249,7 @@ def setup(config):
 
     ema_model = AveragedModel(model, avg_fn=get_ema_avg_fn(config.ema_decay))
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        param_groups(config, model),
         lr=config.opt.lr,
         weight_decay=config.opt.weight_decay,
         betas=(config.opt.beta1, config.opt.beta2)    
@@ -221,6 +270,41 @@ def setup(config):
         train_state = resume_state(train_state, logger)
 
     return train_state, logger
+
+
+def _raw_module(module):
+    """Peel Fabric / torch.compile / DDP wrappers off to reach FRMWrapper."""
+    for attr in ("_original_module", "_orig_mod", "module"):
+        inner = getattr(module, attr, None)
+        if isinstance(inner, nn.Module):
+            return _raw_module(inner)
+    return module
+
+
+@torch.no_grad()
+def task_emb_stats(model)->dict:
+    """Scale diagnostics for the task embedding table.
+
+    `rms_common` is the component shared by every task -- a gauge direction
+    the loss is largely blind to -- and `rms_dev` is what actually separates
+    one task from another.  Growth that sits entirely in `rms_common` means
+    the table is inflating without doing any work, which is the signature of
+    Adam drifting along a flat direction rather than of the loss asking for a
+    larger embedding.  Compare the slope of `rms` against the current lr: a
+    slope near lr means the update is normalisation-driven, not gradient-
+    driven.  See `config.model.norm_task_emb`.
+    """
+    table = _raw_module(model).inner.task_emb.embedding_weight.float()
+    common = table.mean(dim=0, keepdim=True)
+    dev = table - common
+    per_row = table.square().mean(dim=1).sqrt()
+    return {
+        "task_emb/rms": table.square().mean().sqrt().item(),
+        "task_emb/rms_common": common.square().mean().sqrt().item(),
+        "task_emb/rms_dev": dev.square().mean().sqrt().item(),
+        "task_emb/rms_row_min": per_row.min().item(),
+        "task_emb/rms_row_max": per_row.max().item(),
+    }
 
 
 def train_batch(config, train_state, batch)->TrainState:
@@ -331,7 +415,10 @@ def run(_):
 
             if (k+1) % 10 == 0:
                 metrics = {k: fabric.all_reduce(v) for k, v in train_state.metrics.compute().items()}
-                logger.log_metrics(dict(train=metrics, lr=cur_lr), step=train_state.step)
+                # weights are replicated across ranks, so no all_reduce here
+                log = dict(train=metrics, lr=cur_lr)
+                log.update(task_emb_stats(train_state.model))
+                logger.log_metrics(log, step=train_state.step)
 
         save_state(train_state, logger)
 
@@ -346,11 +433,7 @@ def run(_):
     if fabric.is_global_zero:
         cp_file = cp_dir(logger) / "final_ema.pt"
         torch.save(train_state.ema_model.module, cp_file)
-
-        artifact = wandb.Artifact(name="model_"+ logger.experiment.name , type="model")
-        artifact.add_file(cp_file, name="final_ema.pt")
-        aliases = ["latest"]
-        logger.experiment.log_model(artifact, aliases=aliases)
+        fabric.print(f"Final EMA weights saved to {cp_file}")
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')

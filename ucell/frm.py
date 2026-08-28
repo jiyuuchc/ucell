@@ -55,8 +55,26 @@ class FRM(nn.Module):
 
         self.patch_emb = nn.Conv2d(3, config.hidden_size, kernel_size=ps, stride=ps, padding=0)
 
+        # With `norm_task_emb` the table is split into a unit-RMS direction
+        # and an explicit per-token gain.  The direction then carries no scale,
+        # so drift in it cannot reach the output, and the gain is the small
+        # tensor that actually sets conditioning strength -- and the only one
+        # weight decay can act on meaningfully.  A normalised direction must
+        # not start at exactly zero: rms_norm maps that to zero and hands it a
+        # 1/sqrt(eps) Jacobian, so it gets a real init instead.  Unnormalised,
+        # the zero init is left exactly as it was.
+        self.norm_task_emb = getattr(config, "norm_task_emb", False)
+        task_emb_init_std = embed_init_std if self.norm_task_emb else 0
         self.task_emb = CastedEmbedding(config.num_tasks, config.num_task_emb_tokens * config.hidden_size,
-                                init_std=0, cast_to=dtype)
+                                init_std=task_emb_init_std, cast_to=dtype)
+        if self.norm_task_emb:
+            # embed_init_std leaves the task token at O(1) against the
+            # unit-RMS z it is added to, once the sqrt(hidden_size) input
+            # scaling at the end of _input_embeddings is applied.
+            self.task_emb_gain = nn.Parameter(torch.full(
+                (config.num_tasks, config.num_task_emb_tokens, 1),
+                embed_init_std,
+            ))
     
         if config.pos_emb == 'learned':
             self.pos_emb = CastedEmbedding(config.seq_len, config.hidden_size, init_std=embed_init_std, cast_to=dtype)
@@ -81,6 +99,12 @@ class FRM(nn.Module):
         # task embeddings
         task_embedding = self.task_emb(task_id)
         task_embedding = rearrange(task_embedding, "b (l d) -> b l d", d=self.config.hidden_size)
+        if self.norm_task_emb:
+            # Per token, matching the blocks' own rms_norm, then rescaled by
+            # the explicit gain.  See __init__ for why these are separate.
+            task_embedding = rms_norm(task_embedding, variance_epsilon=1e-5)
+            gain = self.task_emb_gain[task_id.long()]
+            task_embedding = task_embedding * gain.to(task_embedding.dtype)
         num_addition_tokens = self.config.num_z_tokens - task_embedding.shape[1]
         task_embedding = F.pad(task_embedding, (0, 0, 0, num_addition_tokens), value=0)
 
@@ -134,6 +158,54 @@ class FRM(nn.Module):
                 k = k[len("inner."):]
 
             new_state_dict[k] = v
+        return new_state_dict
+
+    TASK_EMB_KEY = "task_emb.embedding_weight"
+    TASK_EMB_GAIN_KEY = "task_emb_gain"
+
+    @classmethod
+    def _split_task_emb_gain(cls, state_dict, hidden_size, generator=None):
+        """Split a plain task embedding table into a unit-RMS direction plus
+        an explicit per-token gain, so that a checkpoint written before
+        `norm_task_emb` existed stays loadable.
+
+        Function-preserving: `gain * rms_norm(direction)` reproduces the
+        original table up to rms_norm's epsilon.  Tokens that are exactly zero
+        (never trained -- see `collapse_task_id`) have no defined direction and
+        would stay un-learnable forever, so they get a random direction and a
+        zero gain.  That still reproduces their zero contribution exactly,
+        while leaving a non-zero gradient path for the gain to grow along.
+        """
+        key = next(
+            (k for k in state_dict if k.endswith(cls.TASK_EMB_KEY)), None
+        )
+        if key is None:
+            return state_dict
+        prefix = key[: -len(cls.TASK_EMB_KEY)]
+        gain_key = prefix + cls.TASK_EMB_GAIN_KEY
+        if gain_key in state_dict:
+            return state_dict
+
+        table = state_dict[key]
+        tok = table.detach().float().view(table.shape[0], -1, hidden_size)
+        gain = tok.square().mean(-1, keepdim=True).sqrt()
+        dead = gain <= 0
+        direction = tok / gain.clamp_min(torch.finfo(torch.float32).tiny)
+        if dead.any():
+            noise = torch.randn(
+                direction.shape, generator=generator, dtype=torch.float32
+            )
+            noise = noise / noise.square().mean(-1, keepdim=True).sqrt()
+            direction = torch.where(dead, noise, direction)
+            warnings.warn(
+                f"{int(dead.sum())} of {gain.numel()} task embedding tokens "
+                "were exactly zero; giving them a random direction and a zero "
+                "gain so they still contribute nothing but can be trained."
+            )
+
+        new_state_dict = dict(state_dict)
+        new_state_dict[key] = direction.reshape(table.shape).to(table.dtype)
+        new_state_dict[gain_key] = gain
         return new_state_dict
 
     @staticmethod
@@ -231,6 +303,14 @@ class FRM(nn.Module):
         # split legacy fused gate_up_proj into gate_proj + up_proj (must be
         # after LoRA merging so adapters are already folded in)
         new_state_dict = self._split_legacy_fused_layers(new_state_dict)
+
+        # a checkpoint written before norm_task_emb existed carries the plain
+        # table; split it into direction + gain so it stays loadable.  Must be
+        # before the shape check below, which also inspects task_emb keys.
+        if self.norm_task_emb:
+            new_state_dict = self._split_task_emb_gain(
+                new_state_dict, self.config.hidden_size
+            )
 
         # if embedding dim mismatch, give a warning and load only the rest of the state
         model_state_dict = self.state_dict()
