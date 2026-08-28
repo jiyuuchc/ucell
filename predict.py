@@ -8,7 +8,7 @@ import pandas as pd
 from ml_collections import config_flags
 from tqdm import tqdm
 from ucell.frm import FRMWrapper
-from ucell.utils import patcherize
+from ucell.utils import patcherize, clean_up_mask
 from ucell.dynamics import compute_masks, remove_bad_flow_masks
 
 flags.DEFINE_string("model", None, "checkpointing location")
@@ -16,10 +16,24 @@ flags.DEFINE_string("datadir", None, "test data dir")
 flags.DEFINE_string("outputdir", "predictions", "logging dir")
 flags.DEFINE_integer("niter", 500, "Num of integration steps for mask computation")
 flags.DEFINE_float("flow_scaling", 4.0, "Flow scaling")
-flags.DEFINE_float("cellprob_threshold", 0, "Cell prob logit threshold")
+flags.DEFINE_float("cellprob_threshold", -0.5, "Cell prob logit threshold")
 flags.DEFINE_float("flow_err_threshold", 0, "Flow error threshold") 
 flags.DEFINE_integer("task_id", 0, "Task id for multi-task models")
 flags.DEFINE_integer("min_area", 5, "Min cell area")
+flags.DEFINE_float(
+    "instance_logit_threshold", -999,
+    "Drop instances whose mean mask logit is below this (-999 = disabled)",
+)
+flags.DEFINE_boolean(
+    "force", False,
+    "Re-run the model even where *_flow and *_logits already exist",
+)
+flags.DEFINE_boolean(
+    "save_intermediates", True,
+    "Write the *_flow and *_logits tiffs alongside *_mask. Nothing in the "
+    "repo reads them -- eval.py only opens *_mask -- and they are ~12x its "
+    "size, so pass --nosave_intermediates for sweeps that only need metrics.",
+)
 
 _CONFIG = config_flags.DEFINE_config_file("config", "config.py")
 
@@ -67,8 +81,31 @@ def _compute_masks(flow, cell_prob):
     if flags.FLAGS.flow_err_threshold > 0:
         mask = remove_bad_flow_masks(mask, flow * 5, threshold=flags.FLAGS.flow_err_threshold, device=torch.device('cuda'))
 
+    mask = _filter_by_instance_logit(mask, cell_prob)
+
     return mask
 
+
+def _filter_by_instance_logit(mask, cell_prob):
+    """Remove instances whose mean mask logit falls below the threshold."""
+    threshold = flags.FLAGS.instance_logit_threshold
+    if threshold <= -999 or mask.max() == 0:
+        return mask
+
+    n_labels = int(mask.max()) + 1
+    flat = mask.ravel()
+    area = np.bincount(flat, minlength=n_labels)
+    total = np.bincount(flat, weights=cell_prob.ravel(), minlength=n_labels)
+    mean_logit = total / np.maximum(area, 1)
+
+    drop = mean_logit < threshold
+    drop[0] = False  # background is not an instance
+    if not drop.any():
+        return mask
+
+    mask = np.where(drop[mask], 0, mask)
+
+    return clean_up_mask(mask)
 
 def grpc_call(server, image):
     import grpc
@@ -101,7 +138,9 @@ def grpc_call(server, image):
 def run(_):
     config = _CONFIG.value
 
-    model = load_model()
+    # loaded on first use: a sweep that reuses every saved intermediate never
+    # touches the model, so it skips the checkpoint load and torch.compile too
+    model = None
     datapath = Path(flags.FLAGS.datadir)
     outpath = Path(flags.FLAGS.outputdir)
 
@@ -111,37 +150,49 @@ def run(_):
 
         outpath_ = outpath / relative
         outpath_.mkdir(exist_ok=True, parents=True)
-        # if (outpath_/name.replace("_label", "_mask")).exists():
-        #     # print(f"Skipping {name} as output already exists")
-        #     continue
 
-        img_fn = label_fn.with_name(name.replace("_label", ""))
-        img = format_image(tifffile.imread(img_fn))
+        flow_fn = outpath_/name.replace("_label", "_flow")
+        logits_fn = outpath_/name.replace("_label", "_logits")
+        reused = (not flags.FLAGS.force
+                  and flow_fn.exists() and logits_fn.exists())
 
-        if isinstance(model, nn.Module):
-            with torch.device('cuda'):
-                out = patcherize(
-                    model.predict, 
-                    GS=config.image_size,
-                )(img, flags.FLAGS.task_id)
-
-            flow = np.moveaxis(out[:, :, :2], -1, 0)
-            cell_prob = out[:, :, 2]
-
+        if reused:
+            flow = tifffile.imread(flow_fn)
+            cell_prob = tifffile.imread(logits_fn)
             mask = _compute_masks(flow, cell_prob)
 
         else:
-            flow, cell_prob = None, None
-            mask = grpc_call(model, img)
+            if model is None:
+                model = load_model()
 
-        if flow is not None:
-            tifffile.imwrite(outpath_/name.replace("_label", "_flow"), flow)
-        if cell_prob is not None:
-            tifffile.imwrite(outpath_/name.replace("_label", "_logits"), cell_prob)
+            img_fn = label_fn.with_name(name.replace("_label", ""))
+            img = format_image(tifffile.imread(img_fn))
+
+            if isinstance(model, nn.Module):
+                with torch.device('cuda'):
+                    out = patcherize(
+                        model.predict, 
+                        GS=config.image_size,
+                    )(img, flags.FLAGS.task_id)
+
+                flow = np.moveaxis(out[:, :, :2], -1, 0)
+                cell_prob = out[:, :, 2]
+
+                mask = _compute_masks(flow, cell_prob)
+
+            else:
+                flow, cell_prob = None, None
+                mask = grpc_call(model, img)
+
+        # nothing new to write when the intermediates came off disk
+        if flags.FLAGS.save_intermediates and not reused:
+            if flow is not None:
+                tifffile.imwrite(flow_fn, flow)
+            if cell_prob is not None:
+                tifffile.imwrite(logits_fn, cell_prob)
         tifffile.imwrite(outpath_/name.replace("_label", "_mask"), mask.astype('uint16'))
 
 
 if __name__ == "__main__":
     app.run(run)
-
 

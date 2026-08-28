@@ -8,12 +8,6 @@ transformer is applied repeatedly to refine an internal representation, so
 depth comes from recursion rather than from parameters — which is why the
 model stays small while generalizing across imaging modalities.
 
-Recursion depth is a free parameter at inference and need not match the
-schedule a checkpoint was trained under. The released checkpoints ship at
-21 recursions (`H_cycles=1`, `L_cycles=21`), which is the setting all
-reported results use. Fewer recursions trade accuracy for speed:
-`overrides={"model.L_cycles": 7}` runs three times shallower.
-
 ## Requirements
 
 **Python 3.11 or newer.**
@@ -25,11 +19,6 @@ mainly buys throughput. Measured on a single 383x512 two-channel image:
 | --- | --- | --- | --- | --- |
 | `ucell-768.pt`  | 14.7M | 376 MiB | 0.2 s | 12 s |
 | `ucell-1024.pt` | 26.4M | 525 MiB | 0.2 s | — |
-
-Inference is tiled into 256x256 patches, so peak memory is set by the patch
-count of one image, not by its total size. Any CUDA GPU with ~2 GB free is
-ample. Fine-tuning is heavier: budget ~24 GB for the 768 model at batch size
-64, and a multi-GPU node for training from scratch.
 
 ## Installation
 
@@ -76,10 +65,6 @@ Pretrained checkpoints live on the Hugging Face Hub at
 | --- | --- | --- |
 | `ucell-768.pt`  | 56 MB  | 768  |
 | `ucell-1024.pt` | 101 MB | 1024 |
-
-Each file holds a `config` and a `state_dict`, so it carries its own
-configuration and needs no config file to load — `FRMWrapper.from_checkpoint`
-reads both. Download them with the CLI or from Python:
 
 ```bash
 huggingface-cli download jiyuuchc/ucell ucell-768.pt
@@ -149,12 +134,5 @@ python train.py \
 
 Save your training data (`*.tif`, `*_label.tif`) under `${DATADIR}/train`.
 `${BASE_MODEL}` is one of the checkpoints above.
-
-## Interactive use
-
-UCell can be served over gRPC and driven from a GUI client such as
-[napari-biopb](https://github.com/biopb/napari-biopb). See the
-[protocol docs](https://buf.build/jiyuuchc/biopb) and
-[code examples](https://github.com/biopb/biopb/tree/main/src/examples).
 
 ---
