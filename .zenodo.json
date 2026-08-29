@@ -1,0 +1,33 @@
+{
+  "upload_type": "software",
+  "title": "UCell: a small recursive transformer for generalizable cell segmentation",
+  "description": "<p>UCell is a ~15M-parameter recursive transformer for cell instance segmentation. The same two-block transformer is applied repeatedly to refine an internal representation, so depth comes from recursion rather than from parameters, which keeps the model small while generalizing across imaging modalities.</p><p>This record archives the source code. Preprint: <a href=\"https://doi.org/10.48550/arXiv.2604.00243\">https://doi.org/10.48550/arXiv.2604.00243</a></p>",
+  "creators": [
+    {
+      "name": "Yu, Ji",
+      "affiliation": "University of Connecticut Health Center"
+    }
+  ],
+  "license": "MIT",
+  "access_right": "open",
+  "keywords": [
+    "cell segmentation",
+    "microscopy",
+    "deep learning",
+    "transformer",
+    "recursive model",
+    "bioimage analysis"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "10.48550/arXiv.2604.00243",
+      "relation": "isSupplementTo",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "https://github.com/jiyuuchc/ucell",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}
