@@ -220,6 +220,18 @@ def balanced_sample(rows, k, rng):
     return picked
 
 
+def load_ref(label_fn, args):
+    """The reference candidate ('gt' throughout): the human label, or with
+    --ref_run another model's mask for the same image, so two models can
+    be judged against each other where no labels exist."""
+    if not args.ref_run:
+        return tifffile.imread(label_fn)
+    subset = label_fn.parent.name
+    mf = (Path("predictions") / f"{args.ref_run}_{subset}"
+          / label_fn.name.replace("_label", "_mask"))
+    return tifffile.imread(mf) if mf.exists() else None
+
+
 def mine(args):
     rng = random.Random(args.seed)
     rows = []
@@ -237,7 +249,10 @@ def mine(args):
             labels = labels[:args.max_images]
         found = []
         for lf in labels:
-            gt = tifffile.imread(lf).astype(np.int64)
+            gt = load_ref(lf, args)
+            if gt is None:
+                continue
+            gt = gt.astype(np.int64)
             if gt.min() < 0:   # has ignore regions; skip the image
                 continue
             mf = pred_dir / lf.name.replace("_label", "_mask")
@@ -358,7 +373,7 @@ def render_pair(row, args):
     data = Path(args.data) / row.subset
     pred_dir = Path("predictions") / f"{args.run}_{row.subset}_t{args.tid}"
     img = tifffile.imread(data / f"{row.image}")
-    gt = tifffile.imread(data / f"{row.image}".replace(".tif", "_label.tif"))
+    gt = load_ref(data / f"{row.image}".replace(".tif", "_label.tif"), args)
     pred = tifffile.imread(
         pred_dir / f"{row.image}".replace(".tif", "_mask.tif"))
     sl = (slice(row.y0, row.y1), slice(row.x0, row.x1))
@@ -379,6 +394,41 @@ def render_pair(row, args):
         out / f"{row.pair_id}_o0.png")
     compose([big, pan_pr, pan_gt], ["RAW", "A", "B"]).save(
         out / f"{row.pair_id}_o1.png")
+    if args.context_px:
+        render_context(rgb, row, args, out / f"{row.pair_id}_ctx.png")
+
+
+def render_context(rgb, row, args, path):
+    """The whole field of view, downscaled, with the crop boxed: lets the
+    judge see what the cells in this sample look like and what is
+    background before judging a crop that may contain neither."""
+    full = stretch_rgb(rgb)
+    H, W = full.shape[:2]
+    s = min(1.0, args.context_px / max(H, W))
+    im = Image.fromarray(full).resize((int(W * s), int(H * s)), Image.BICUBIC)
+    d = ImageDraw.Draw(im)
+    box = [row.x0 * s, row.y0 * s, row.x1 * s, row.y1 * s]
+    d.rectangle(box, outline=(255, 230, 0), width=3)
+    header = Image.new("RGB", (im.width, 30), (20, 20, 20))
+    ImageDraw.Draw(header).text(
+        (8, 4), "FULL IMAGE (judged crop boxed in yellow)",
+        fill=(255, 255, 255), font=font(22))
+    canvas = Image.new("RGB", (im.width, im.height + 30))
+    canvas.paste(header, (0, 0)); canvas.paste(im, (0, 30))
+    canvas.save(path)
+
+
+CONTEXT_PROMPT = (
+    "The first image is the entire field of view with the judged crop boxed "
+    "in yellow; use it to see what the cells in this sample look like and "
+    "what is background, debris or culture-vessel structure.  The second "
+    "image is the three-panel crop to judge."
+)
+
+
+def _ctx_path(png):
+    p = png.with_name(png.name.rsplit("_o", 1)[0] + "_ctx.png")
+    return p if p.exists() else None
 
 
 def render(args):
@@ -400,7 +450,14 @@ _ANT_WARNED = {"done": False}
 def ask(client, png, args):
     """One judgement.  Returns the parsed answer plus usage.  Falls back to
     free-form JSON if the endpoint rejects structured output."""
-    content = [
+    content = []
+    ctx = _ctx_path(png) if args.context else None
+    if ctx:
+        content += [{"type": "text", "text": CONTEXT_PROMPT},
+                    {"type": "image", "source": {"type": "base64",
+                                                 "media_type": "image/png",
+                                                 "data": _png_b64(ctx)}}]
+    content += [
         {"type": "image", "source": {"type": "base64",
                                      "media_type": "image/png",
                                      "data": _png_b64(png)}},
@@ -498,7 +555,14 @@ def _oai_variants(args):
 
 def ask_openai(client, png, args):
     import openai
-    content = [
+    content = []
+    ctx = _ctx_path(png) if args.context else None
+    if ctx:
+        content += [{"type": "text", "text": CONTEXT_PROMPT},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64," + _png_b64(ctx),
+                        "detail": "high"}}]
+    content += [
         {"type": "text", "text": USER_PROMPT + " Keys: choice (A, B or "
          "tie), confidence (0-1), n_cells (integer), reason (short)."},
         {"type": "image_url", "image_url": {
@@ -704,7 +768,83 @@ def report(args):
     for t in tables:
         print(t.round(3).to_string(), "\n")
     per_image_table(d, args, out)
+    if args.ref_run:
+        label_check(d, args, out)
     write_sheet(d, w, out)
+
+
+def crop_f1(cand, gt, min_frac=0.5):
+    """Instance F1 of a candidate against the human label inside one crop.
+    Instances are counted if at least `min_frac` of their area lies in the
+    crop, so cells cut by the crop edge do not dominate."""
+    def inside(lbl):
+        full = np.bincount(lbl["full"].ravel())
+        part = np.bincount(lbl["crop"].ravel(), minlength=len(full))
+        ids = [i for i in np.unique(lbl["crop"]) if i > 0
+               and part[i] >= min_frac * full[i]]
+        return np.where(np.isin(lbl["crop"], ids), lbl["crop"], 0)
+    c, g = inside(cand), inside(gt)
+    c_rps, g_rps = regionprops(c), regionprops(g)
+    if not c_rps and not g_rps:
+        return 1.0   # nothing there and nothing drawn: fully correct
+    if not c_rps or not g_rps:
+        return 0.0
+    its = mask_intersection(c_rps, g_rps)
+    ca = np.array([r.area_filled for r in c_rps], float)
+    ga = np.array([r.area_filled for r in g_rps], float)
+    iou = its / (ca[:, None] + ga[None, :] - its)
+    tp = (iou.max(axis=1) >= 0.5).sum()
+    return 2 * tp / (len(c_rps) + len(g_rps))
+
+
+def label_check(d, args, out):
+    """When the reference is another model, the human label can still say
+    which candidate was right in each crop.  'gt' in d means --ref_run."""
+    cache = {}
+    truth = []
+    for pid, r in d.iterrows():
+        key = (r.subset, r.image)
+        if key not in cache:
+            data = Path(args.data) / r.subset
+            lab = tifffile.imread(data / r.image.replace(".tif", "_label.tif"))
+            pr = tifffile.imread(Path("predictions") / f"{args.run}_{r.subset}_t{args.tid}"
+                                 / r.image.replace(".tif", "_mask.tif"))
+            rf = tifffile.imread(Path("predictions") / f"{args.ref_run}_{r.subset}"
+                                 / r.image.replace(".tif", "_mask.tif"))
+            cache[key] = (lab.astype(np.int64), pr.astype(np.int64),
+                          rf.astype(np.int64))
+        lab, pr, rf = cache[key]
+        sl = (slice(r.y0, r.y1), slice(r.x0, r.x1))
+        f_pred = crop_f1({"full": pr, "crop": pr[sl]}, {"full": lab, "crop": lab[sl]})
+        f_ref = crop_f1({"full": rf, "crop": rf[sl]}, {"full": lab, "crop": lab[sl]})
+        t = ("pred" if f_pred > f_ref + 1e-9
+             else "gt" if f_ref > f_pred + 1e-9 else "tie")
+        truth.append((pid, f_pred, f_ref, t))
+    tr = pd.DataFrame(truth, columns=["pair_id", "f1_pred_vs_label",
+                                      "f1_ref_vs_label", "label_says"]
+                      ).set_index("pair_id")
+    d = d.join(tr)
+    d.to_csv(out / "judgements.csv")
+    dec = d[d.label_says != "tie"]
+    both = dec[dec.consistent & dec.decided]
+    gated = both[both.conf >= args.conf]
+    acc = lambda x: (x.pick0 == x.label_says).mean() if len(x) else np.nan  # noqa: E731
+    print(f"label check (reference model = {args.ref_run}): the human label "
+          f"decides {len(dec)} of {len(d)} crops; label favours {args.run} "
+          f"in {(dec.label_says == 'pred').mean():.0%}, {args.ref_run} in "
+          f"{(dec.label_says == 'gt').mean():.0%}")
+    print(f"  judge agrees with label: per-answer "
+          f"{((dec.pick0 == dec.label_says).mean() + (dec.pick1 == dec.label_says).mean()) / 2:.3f}; "
+          f"consistent pairs {acc(both):.3f} (n={len(both)}); "
+          f"consistent+confident {acc(gated):.3f} (n={len(gated)})")
+    g = dec.groupby("event")
+    by = pd.DataFrame({
+        "n": g.size(),
+        "label_favours_pred": g.apply(lambda x: (x.label_says == "pred").mean()),
+        "judge_agrees_label": g.apply(lambda x: ((x.pick0 == x.label_says).mean()
+                                                 + (x.pick1 == x.label_says).mean()) / 2),
+    })
+    print(by.round(3).to_string(), "\n")
 
 
 def per_image_table(d, args, out):
@@ -773,6 +913,11 @@ def main():
                    help="predictions/<run>_<subset>_t<tid> is the candidate")
     p.add_argument("--tid", type=int, default=0)
     p.add_argument("--data", default=os.path.expanduser("~/datasets/scs_val"))
+    p.add_argument("--ref_run", default=None,
+                   help="use predictions/<ref_run>_<subset>/*_mask.tif as "
+                        "the reference candidate instead of the human "
+                        "labels (e.g. cpsam_v2_musc -> --ref_run cpsam_v2); "
+                        "'gt' in the report then means that model")
     p.add_argument("--subsets", nargs="+", default=SUBSETS)
     p.add_argument("--out", default=None,
                    help="default analyses/vlm_judge/<run>")
@@ -789,6 +934,12 @@ def main():
                         "from each (per-image verdict rates)")
     # render
     p.add_argument("--panel_px", type=int, default=448)
+    p.add_argument("--context_px", type=int, default=0,
+                   help="render: also save the full image downscaled to "
+                        "this long edge with the crop boxed (<pair>_ctx.png)")
+    p.add_argument("--context", action="store_true",
+                   help="query: send the full-image context PNG ahead of "
+                        "the crop panels when it exists")
     p.add_argument("--line_px", type=int, default=2)
     # query
     p.add_argument("--backend", default="anthropic",
