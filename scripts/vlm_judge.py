@@ -50,6 +50,7 @@ import os
 import random
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -247,6 +248,8 @@ def mine(args):
             gray = to_gray(img)
             accepted = []
             for ev, gids, pids in find_events(gt, pred):
+                if ev not in args.events:
+                    continue
                 bb = union_bbox(gt, pred, gids, pids)
                 crop = square_crop(bb, gt.shape)
                 if any(box_iou(crop, c) > 0.5 for c in accepted):
@@ -479,8 +482,10 @@ def _oai_variants(args):
                   "json_schema": {"name": "verdict", "strict": True,
                                   "schema": ANSWER_SCHEMA}}
     fmt_obj = {"type": "json_object"}
+    fmts = {"schema": (fmt_schema, fmt_obj, None), "object": (fmt_obj, None),
+            "none": (None,)}[args.json_mode]
     v = []
-    for fmt in (fmt_schema, fmt_obj, None):
+    for fmt in fmts:
         for reasoning in ((args.effort,) if args.reasoning else ()) + (None,):
             kw = {}
             if fmt:
@@ -546,10 +551,17 @@ def make_client(args):
         import openai
         key = os.environ.get(args.api_key_env) or "EMPTY"
         base = args.base_url or os.environ.get("OPENAI_BASE_URL")
+        headers = {}
+        for h in args.header or []:
+            name, _, value = h.partition(":")
+            headers[name.strip()] = value.strip().replace(
+                "{session}", f"vlm-judge-{uuid.uuid4().hex[:12]}")
         print(f"openai backend: base_url={base or 'api.openai.com'} "
-              f"key={'set' if key != 'EMPTY' else 'EMPTY'}")
+              f"key={'set' if key != 'EMPTY' else 'EMPTY'} "
+              f"headers={sorted(headers)}")
         return openai.OpenAI(api_key=key, base_url=base, max_retries=5,
-                             timeout=args.timeout), ask_openai
+                             timeout=args.timeout,
+                             default_headers=headers or None), ask_openai
     import anthropic
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ANTHROPIC_API_KEY is not set; the SDK will fall back to an "
@@ -769,6 +781,9 @@ def main():
     p.add_argument("--max_images", type=int, default=60,
                    help="images scanned per subset before sampling events")
     p.add_argument("--n_per_subset", type=int, default=40)
+    p.add_argument("--events", nargs="+", default=EVENTS, choices=EVENTS,
+                   help="event types to mine; drop 'spurious' on sparsely "
+                        "annotated sets where unlabeled cells are real")
     p.add_argument("--per_image", type=int, default=0,
                    help="instead: scan every image and take up to K events "
                         "from each (per-image verdict rates)")
@@ -797,7 +812,19 @@ def main():
     p.add_argument("--api_key_env", default="OPENAI_API_KEY",
                    help="env var holding the key for --backend openai; "
                         "'EMPTY' is sent when unset (local servers)")
-    p.add_argument("--max_tokens", type=int, default=2048)
+    p.add_argument("--header", action="append", metavar="NAME: VALUE",
+                   help="openai backend: extra request header, repeatable; "
+                        "'{session}' in the value becomes a random per-run "
+                        "id (opencode.ai wants 'x-opencode-session: "
+                        "{session}')")
+    p.add_argument("--json_mode", default="schema",
+                   choices=["schema", "object", "none"],
+                   help="openai backend: strongest response_format to try "
+                        "(some models echo a json_schema instead of "
+                        "answering; 'object' or 'none' skips it)")
+    p.add_argument("--max_tokens", type=int, default=2048,
+                   help="raise for reasoning models that spend tokens "
+                        "before the visible answer")
     p.add_argument("--timeout", type=float, default=120.0,
                    help="openai backend per-request timeout, seconds")
     p.add_argument("--workers", type=int, default=4)
