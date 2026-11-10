@@ -40,15 +40,18 @@ def rank_zero_first():
             dist.barrier()
 
 def random_flip(image, label):
+    # label channels: flow_y, flow_x, segmentation[, ignore]; only the two
+    # flow components change sign / swap under flips and transposes
+    rest = list(range(2, label.shape[-1]))
     if random.random() >= .5:
         image = image[::-1]
-        label = label[::-1] * (-1, 1, 1)
+        label = label[::-1] * np.array([-1, 1] + [1] * len(rest))
     if random.random() >= .5:
         image = image[:, ::-1]
-        label = label[:, ::-1] * (1, -1, 1)
+        label = label[:, ::-1] * np.array([1, -1] + [1] * len(rest))
     if random.random() >= .5:
         image = image.transpose(1,0,2)
-        label = label[..., (1,0,2)].transpose(1,0,2)
+        label = label[..., [1, 0] + rest].transpose(1,0,2)
 
     return image, label
     
@@ -62,7 +65,11 @@ def format_and_augment(example, *, imagesize = 256, augment=True):
         segmentation = (label != 0).any(axis=0, keepdims=True).astype(label.dtype)
         label = np.r_[label, segmentation]
 
-    assert label.shape[0] == 3
+    if label.shape[0] == 3:
+        # no don't-care channel: every pixel is supervised
+        label = np.r_[label, np.zeros_like(label[:1])]
+
+    assert label.shape[0] == 4
 
     # preprocess
     image = pad_channel(image)
@@ -126,12 +133,16 @@ def compute_label(example):
             example['label'] = [flow_y, flow_x, Image.fromarray(segmentation.astype("float32"))]
     
         else:
+            # negative mask values mark don't-care pixels: no instance is
+            # claimed there and no loss is taken there (4th label channel)
             mask = np.array(example['masks'])
-            segmentation = (mask != 0).astype("float32")
+            segmentation = (mask > 0).astype("float32")
+            ignore = (mask < 0).astype("float32")
             mask = clean_up_mask(np.maximum(mask, 0))
             flow = np.asarray(masks_to_flows_gpu(mask, device=torch.device("cuda"))).astype("float32")
 
-            example['label'] = [Image.fromarray(flow[i]) for i in range(2)] + [Image.fromarray(segmentation)]
+            example['label'] = ([Image.fromarray(flow[i]) for i in range(2)]
+                                + [Image.fromarray(segmentation), Image.fromarray(ignore)])
 
     return example
 

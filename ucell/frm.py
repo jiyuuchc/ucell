@@ -408,7 +408,14 @@ class FRMWrapper(nn.Module):
 
             det_loss = F.binary_cross_entropy_with_logits(
                 output['mask'], gt_mask, reduction="none",
-            ).mean(dim=(1,2))
+            )
+            if label.shape[1] > 3:
+                # optional don't-care channel (1 = no supervision); the flow
+                # loss is already zero there because the flow target is zero
+                w = 1 - label[:, 3]
+                det_loss = (det_loss * w).sum(dim=(1,2)) / w.sum(dim=(1,2)).clamp(min=1)
+            else:
+                det_loss = det_loss.mean(dim=(1,2))
 
             l2_loss = .5 * torch.square(gt_flow - output['flow']) * (gt_flow != 0).any(dim=1, keepdim=True)
             l2_loss = l2_loss.mean(dim=(1,2,3))

@@ -426,6 +426,13 @@ CONTEXT_PROMPT = (
 )
 
 
+def _user_prompt(args):
+    """The question, prefixed with the user's description of the sample
+    when --hint is given (what the cells look like, what is not a cell)."""
+    hint = getattr(args, "hint", None)
+    return (f"About this sample: {hint.strip()}\n\n" if hint else "") + USER_PROMPT
+
+
 def _ctx_path(png):
     p = png.with_name(png.name.rsplit("_o", 1)[0] + "_ctx.png")
     return p if p.exists() else None
@@ -461,7 +468,7 @@ def ask(client, png, args):
         {"type": "image", "source": {"type": "base64",
                                      "media_type": "image/png",
                                      "data": _png_b64(png)}},
-        {"type": "text", "text": USER_PROMPT},
+        {"type": "text", "text": _user_prompt(args)},
     ]
     kw = dict(
         model=args.model, max_tokens=args.max_tokens,
@@ -563,7 +570,7 @@ def ask_openai(client, png, args):
                         "url": "data:image/png;base64," + _png_b64(ctx),
                         "detail": "high"}}]
     content += [
-        {"type": "text", "text": USER_PROMPT + " Keys: choice (A, B or "
+        {"type": "text", "text": _user_prompt(args) + " Keys: choice (A, B or "
          "tie), confidence (0-1), n_cells (integer), reason (short)."},
         {"type": "image_url", "image_url": {
             "url": "data:image/png;base64," + _png_b64(png),
@@ -937,6 +944,10 @@ def main():
     p.add_argument("--context_px", type=int, default=0,
                    help="render: also save the full image downscaled to "
                         "this long edge with the crop boxed (<pair>_ctx.png)")
+    p.add_argument("--hint", default=None,
+                   help="query: one or two sentences describing what the "
+                        "cells in this sample look like and what is not a "
+                        "cell, prepended to the question")
     p.add_argument("--context", action="store_true",
                    help="query: send the full-image context PNG ahead of "
                         "the crop panels when it exists")
