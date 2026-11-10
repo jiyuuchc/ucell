@@ -244,7 +244,7 @@ def setup(config):
             fabric.print("WARNING: train_emb_only and LoRA are both set; "
                          "LoRA adapters will still be trained but non-task embeddings will be frozen.")
         for name, p in model.named_parameters():
-            if not "task_emb" in name:
+            if not ("task_emb" in name or "ctx_encoder" in name):
                 p.requires_grad = False
 
     ema_model = AveragedModel(model, avg_fn=get_ema_avg_fn(config.ema_decay))
@@ -298,7 +298,12 @@ def task_emb_stats(model)->dict:
     common = table.mean(dim=0, keepdim=True)
     dev = table - common
     per_row = table.square().mean(dim=1).sqrt()
-    return {
+    stats = {}
+    ctx = _raw_module(model).inner.ctx_encoder
+    if ctx is not None:
+        # starts at 0; how far it grows is how much the context is used
+        stats["ctx/gain_rms"] = ctx.gain.float().square().mean().sqrt().item()
+    return stats | {
         "task_emb/rms": table.square().mean().sqrt().item(),
         "task_emb/rms_common": common.square().mean().sqrt().item(),
         "task_emb/rms_dev": dev.square().mean().sqrt().item(),

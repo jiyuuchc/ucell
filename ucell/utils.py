@@ -85,6 +85,29 @@ def pad_channel(image):
     return image
 
 
+def make_context(image, size):
+    """Downsample a whole (H, W, C) image to a (C, size, size) float32 array
+    for FRM's context encoder.
+
+    The image is zero-padded to a square at the bottom/right, as to_patches
+    pads, so the aspect ratio survives the resize.  Training (data.py) and
+    inference (predict.py) both go through here, so they cannot drift apart.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    H, W, _ = image.shape
+    L = max(H, W)
+    x = torch.from_numpy(np.ascontiguousarray(image, dtype=np.float32))
+    x = F.pad(x.permute(2, 0, 1), (0, L - W, 0, L - H))
+    x = F.interpolate(
+        x[None], size=(size, size), mode="bilinear",
+        antialias=True, align_corners=False,
+    )[0]
+
+    return x.numpy()
+
+
 def center_crop(image, mask=None, *, crop_size=512):
     """ Take a (image, mask) pair. Return their center crop
     (or padding if needed) of the size (crop_size, crop_size).

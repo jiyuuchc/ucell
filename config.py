@@ -46,6 +46,12 @@ def base():
     # drift without bound.  Normalising makes that direction unidentifiable.
     config.model.norm_task_emb = False
     config.model.depth = 2
+    # Whole-image context (ucell.frm.ContextEncoder).  > 0 feeds a
+    # ctx_size x ctx_size downsampled copy of the full, uncropped image to a
+    # small encoder whose tokens are added to the task embedding.  0 = off.
+    config.model.ctx_size = 0
+    config.model.ctx_patch_size = 16
+    config.model.ctx_depth = 2
     config.model.num_heads = config.model.get_ref('hidden_size')//64
     config.model.num_tasks = 5
     config.model.seq_len = (config.get_ref("image_size") // config.model.get_ref('patch_size')) ** 2
@@ -93,6 +99,16 @@ def get_config(cfg="default"):
         config.train_emb_only = True
         config.opt.weight_decay=0.0
         config.ema_decay=0.95
+    elif cfg == "train_ctx":
+        # train_emb with the context encoder on: the backbone stays frozen,
+        # so any gain over train_emb is down to the whole-image context
+        config.halt_max_steps=1
+        config.model.H_cycles=3
+        config.model.L_cycles=7
+        config.train_emb_only = True
+        config.opt.weight_decay=0.0
+        config.ema_decay=0.95
+        config.model.ctx_size = 256
     else:
         assert cfg == 'default'
 

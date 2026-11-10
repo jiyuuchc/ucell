@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from skimage.measure import regionprops
-from ucell.utils import pad_channel
+from ucell.utils import pad_channel, make_context
 
 
 @contextmanager
@@ -53,7 +53,7 @@ def random_flip(image, label):
     return image, label
     
 
-def format_and_augment(example, *, imagesize = 256, augment=True):
+def format_and_augment(example, *, imagesize = 256, augment=True, ctx_size=0):
     image = example['image'].astype("float32")
     label = example['label'].astype("float32")
     sz = example['sz']
@@ -72,6 +72,10 @@ def format_and_augment(example, *, imagesize = 256, augment=True):
 
     if augment:
         image, label = random_flip(image, label)
+
+    # whole-image context, taken after the flip so it stays consistent with
+    # the crop, and before the crop so it sees the entire image
+    context = make_context(image, ctx_size) if ctx_size > 0 else None
 
     # combine
     combined = np.c_[image, label]
@@ -101,7 +105,11 @@ def format_and_augment(example, *, imagesize = 256, augment=True):
     label = combined[3:]
     task_id = example['task_id'] if 'task_id' in example else 0
 
-    return dict(image=image, label=label, task_id=task_id)
+    out = dict(image=image, label=label, task_id=task_id)
+    if context is not None:
+        out["context"] = torch.from_numpy(context)
+
+    return out
 
 
 def get_sz(fn, default_sz=35.):
@@ -254,6 +262,7 @@ def task_weights(task_ids, alpha):
 
 def get_dataloader(config:"ConfigDict", split:str)->DataLoader|None:
     collapse = config.get("collapse_task_id", -1)
+    ctx_size = config.model.get("ctx_size", 0)
 
     def collate_fn(examples):
         augmented = []
@@ -262,6 +271,7 @@ def get_dataloader(config:"ConfigDict", split:str)->DataLoader|None:
                 example,
                 augment=split=="train", 
                 imagesize=config.image_size,
+                ctx_size=ctx_size,
             )
             if collapse >= 0:
                 # the dataset's own task_id still drives the sampler weights;

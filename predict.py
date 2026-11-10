@@ -8,7 +8,7 @@ import pandas as pd
 from ml_collections import config_flags
 from tqdm import tqdm
 from ucell.frm import FRMWrapper
-from ucell.utils import patcherize, clean_up_mask
+from ucell.utils import patcherize, clean_up_mask, make_context
 from ucell.dynamics import compute_masks, remove_bad_flow_masks
 
 flags.DEFINE_string("model", None, "checkpointing location")
@@ -169,11 +169,15 @@ def run(_):
             img = format_image(tifffile.imread(img_fn))
 
             if isinstance(model, nn.Module):
+                kwargs = {}
+                ctx_size = config.model.get("ctx_size", 0)
+                if ctx_size > 0:
+                    kwargs["context"] = make_context(img, ctx_size)
                 with torch.device('cuda'):
                     out = patcherize(
                         model.predict, 
                         GS=config.image_size,
-                    )(img, flags.FLAGS.task_id)
+                    )(img, flags.FLAGS.task_id, **kwargs)
 
                 flow = np.moveaxis(out[:, :, :2], -1, 0)
                 cell_prob = out[:, :, 2]

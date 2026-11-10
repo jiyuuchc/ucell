@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
-from .layers import rms_norm, SwiGLU, Attention, CastedEmbedding
+from .layers import rms_norm, SwiGLU, Attention, CastedEmbedding, CastedLinear
 
 IGNORE_LABEL_ID = -100
 
@@ -39,6 +39,71 @@ class FRMBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states, variance_epsilon=1e-5)
         return hidden_states
+
+
+class ContextEncoder(nn.Module):
+    """Encode the whole, uncropped input image into task-embedding tokens.
+
+    FRM only ever sees one crop of an image, so anything that is only
+    visible at the scale of the whole image -- overall intensity range,
+    cell density, imaging modality -- is lost to it.  This encoder looks at
+    a downsampled copy of the full image (`ucell.utils.make_context`) and
+    produces one token per task-embedding slot, which FRM adds to the
+    task embedding.
+
+    Patch tokens go through `ctx_depth` blocks and are then average-pooled
+    onto a g x g grid, g**2 == num_task_emb_tokens, so each output token
+    summarises one region of the image.  The output is unit-RMS per token
+    times a per-token gain that starts at exactly zero: a pretrained
+    checkpoint therefore computes the same function as before the encoder
+    was added, and the gain grows only as far as the loss asks it to.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        dtype = getattr(torch, config.forward_dtype)
+        hidden_size = config.hidden_size
+        ps = config.ctx_patch_size
+        assert config.ctx_size % ps == 0, "ctx_size must divide ctx_patch_size"
+        n_patches = (config.ctx_size // ps) ** 2
+        n_tokens = config.num_task_emb_tokens
+        self.grid = math.isqrt(n_tokens)
+        assert self.grid ** 2 == n_tokens, (
+            "context encoder needs a square num_task_emb_tokens"
+        )
+
+        embed_init_std = 1.0 / math.sqrt(hidden_size)
+        self.patch_emb = nn.Conv2d(
+            3, hidden_size, kernel_size=ps, stride=ps, padding=0
+        )
+        self.pos_emb = CastedEmbedding(
+            n_patches, hidden_size, init_std=embed_init_std, cast_to=dtype
+        )
+        self.blocks = nn.Sequential(*[
+            FRMBlock(hidden_size, config.num_heads)
+            for _ in range(config.ctx_depth)
+        ])
+        self.proj = CastedLinear(hidden_size, hidden_size, bias=False)
+        self.gain = nn.Parameter(torch.zeros(n_tokens, 1))
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+
+    def forward(self, context):
+        x = self.patch_emb(context)
+        h, w = x.shape[-2:]
+        x = rearrange(x, "b c h w -> b (h w) c")
+        pos = self.pos_emb.embedding_weight.to(self.dtype)
+        # same input scaling as FRM._input_embeddings
+        x = math.sqrt(self.hidden_size) * 0.707106781 * (x + pos)
+        x = self.blocks(x)
+
+        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
+        x = F.adaptive_avg_pool2d(x, self.grid)
+        x = rearrange(x, "b c h w -> b (h w) c")
+        x = rms_norm(self.proj(rms_norm(x, variance_epsilon=1e-5)),
+                     variance_epsilon=1e-5)
+
+        return x * self.gain.to(x.dtype)
 
 
 class FRM(nn.Module):
@@ -77,6 +142,12 @@ class FRM(nn.Module):
                 embed_init_std,
             ))
     
+        # Optional whole-image context, added to the task embedding.  See
+        # ContextEncoder; ctx_size = 0 (the default) disables it.
+        self.ctx_encoder = None
+        if getattr(config, "ctx_size", 0) > 0:
+            self.ctx_encoder = ContextEncoder(config)
+
         if config.pos_emb == 'learned':
             self.pos_emb = CastedEmbedding(config.seq_len, config.hidden_size, init_std=embed_init_std, cast_to=dtype)
         else:
@@ -87,7 +158,8 @@ class FRM(nn.Module):
         self.config = config
         self.dtype = dtype
 
-    def _input_embeddings(self, image: torch.Tensor, task_id: torch.Tensor):
+    def _input_embeddings(self, image: torch.Tensor, task_id: torch.Tensor,
+                          context: torch.Tensor | None = None):
         # Token embedding
         embedding = self.patch_emb(image)
         shape_2d = embedding.shape[-2:]
@@ -106,6 +178,14 @@ class FRM(nn.Module):
             task_embedding = rms_norm(task_embedding, variance_epsilon=1e-5)
             gain = self.task_emb_gain[task_id.long()]
             task_embedding = task_embedding * gain.to(task_embedding.dtype)
+        if self.ctx_encoder is not None:
+            if context is None:
+                raise ValueError(
+                    "model has a context encoder (ctx_size > 0) but the "
+                    "batch carries no 'context'; see ucell.utils.make_context"
+                )
+            ctx = self.ctx_encoder(context)
+            task_embedding = task_embedding + ctx.to(task_embedding.dtype)
         num_addition_tokens = self.config.num_z_tokens - task_embedding.shape[1]
         task_embedding = F.pad(task_embedding, (0, 0, 0, num_addition_tokens), value=0)
 
@@ -116,7 +196,9 @@ class FRM(nn.Module):
     
     def forward(self, z, batch):
         # Input encoding
-        input_embeddings, (h, w) = self._input_embeddings(batch["image"], batch["task_id"])
+        input_embeddings, (h, w) = self._input_embeddings(
+            batch["image"], batch["task_id"], batch.get("context")
+        )
 
         D = self.config.num_z_tokens
 
@@ -136,11 +218,21 @@ class FRM(nn.Module):
 
         return z, output
 
-    def predict(self, inputs, task_id=0):
+    def predict(self, inputs, task_id=0, context=None):
+        """`context` is the whole image the inputs were cut from, as made by
+        ucell.utils.make_context: (C, S, S), shared by every input, or
+        (B, C, S, S).  Required when the model has a context encoder."""
         B, H, W, C = inputs.shape
         
         image = torch.asarray(inputs, copy=True).to(torch.float32).permute(0, 3, 1, 2)
         batch = dict(image=image, task_id=torch.ones([B], dtype=torch.int32) * task_id)
+        if context is not None:
+            context = torch.asarray(
+                context, dtype=torch.float32, device=image.device
+            )
+            if context.ndim == 3:
+                context = context.expand(B, *context.shape)
+            batch["context"] = context
 
         with torch.no_grad():
             z = torch.zeros([B, self.config.seq_len + self.config.num_z_tokens, self.config.hidden_size])
@@ -315,6 +407,21 @@ class FRM(nn.Module):
 
         # if embedding dim mismatch, give a warning and load only the rest of the state
         model_state_dict = self.state_dict()
+
+        # a checkpoint from before the context encoder existed: keep the
+        # encoder's own init.  Its gain is zero, so the loaded model computes
+        # exactly what the checkpoint did.
+        if self.ctx_encoder is not None and not any(
+            k.startswith("ctx_encoder.") for k in new_state_dict
+        ):
+            warnings.warn(
+                "Checkpoint has no context encoder weights; initialising it "
+                "fresh (zero gain, so outputs are unchanged)."
+            )
+            new_state_dict = dict(new_state_dict)
+            for k, v in model_state_dict.items():
+                if k.startswith("ctx_encoder."):
+                    new_state_dict[k] = v
         for k in model_state_dict.keys():
             if 'task_emb' in k and k in new_state_dict and new_state_dict[k].shape != model_state_dict[k].shape:
                 warnings.warn(f"Shape mismatch for key {k}, model shape {model_state_dict[k].shape}, checkpoint shape {new_state_dict[k].shape}. Skipping this key.")
